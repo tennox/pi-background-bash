@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -1134,4 +1135,400 @@ test("bash background true truncates verbose PBB results and pbb tail --full ret
     await mock.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Multi-session ownership, close-hang, and reconcile-sweep regressions
+//
+// pi caches the extension factory per cwd (loadExtensionsCached), so ONE loaded
+// module serves every session in a pi process. The in-process tests below load
+// the extension once and invoke the factory twice — exactly what pi does for a
+// sibling session — which is the only way to exercise that sharing without
+// spawning two pi processes (each of which would get its own module instance).
+// ---------------------------------------------------------------------------
+
+const EXTENSION_PATH = new URL("../extensions/background-bash.ts", import.meta.url).pathname;
+
+async function loadExtensionFactory() {
+  const { createJiti } = await import("jiti");
+  const jiti = createJiti(import.meta.url, { moduleCache: false, interopDefault: true });
+  const factory = await jiti.import(EXTENSION_PATH, { default: true });
+  assert.equal(typeof factory, "function");
+  return factory;
+}
+
+function pbbKeyFor(sessionFile, sessionId) {
+  return createHash("sha256").update(`${sessionId ?? "no-session-id"}\n${sessionFile}`).digest("hex").slice(0, 24);
+}
+
+function createFakeSession({ cwd, sessionId, sessionFile }) {
+  const handlers = new Map();
+  const messages = [];
+  const tools = new Map();
+  const entries = [];
+  const api = {
+    registerMessageRenderer() {},
+    registerTool(tool) {
+      tools.set(tool.name, tool);
+    },
+    on(event, handler) {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+      return () => {};
+    },
+    sendMessage(message, options) {
+      messages.push({ message, options });
+    },
+  };
+  const ctx = {
+    cwd,
+    hasUI: false,
+    isIdle: () => true,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+      getEntries: () => entries,
+    },
+  };
+  return {
+    api,
+    ctx,
+    entries,
+    messages,
+    tools,
+    bash: () => tools.get("bash"),
+    async emit(event, payload = {}) {
+      for (const handler of handlers.get(event) ?? []) await handler({ type: event, ...payload }, ctx);
+    },
+  };
+}
+
+async function withTemporaryPbbRoot(dir, fn) {
+  const previous = process.env.PBB_ROOT;
+  process.env.PBB_ROOT = dir;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.PBB_ROOT;
+    else process.env.PBB_ROOT = previous;
+  }
+}
+
+async function deadPid() {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    child.on("error", reject);
+    child.on("exit", () => resolve(child.pid));
+  });
+}
+
+test("a sibling session shutdown does not drop another session's completion", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-sibling-${process.pid}-${Date.now()}-`));
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const sessionA = createFakeSession({ cwd: dir, sessionId: "session-a", sessionFile: join(dir, "a.jsonl") });
+  const sessionB = createFakeSession({ cwd: dir, sessionId: "session-b", sessionFile: join(dir, "b.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(sessionA.api);
+      factory(sessionB.api);
+      await sessionA.emit("session_start");
+      await sessionB.emit("session_start");
+
+      const started = await sessionA.bash().execute(
+        "call-sibling-a",
+        { command: "sleep 0.4; echo sibling-safe", background: true },
+        undefined,
+        undefined,
+        sessionA.ctx,
+      );
+      assert.match(JSON.stringify(started.content), /Bash job bg001 started in background/);
+
+      // A sibling session ending used to abort every session's jobs and drop their
+      // completions (shared module-level `activeJobs` + `shuttingDown`).
+      await sessionB.emit("session_shutdown", { reason: "new" });
+
+      await waitForCondition(() => sessionA.messages.length > 0, 15_000);
+      assert.equal(sessionB.messages.length, 0, "sibling session must not receive another session's result");
+
+      const delivered = sessionA.messages.at(-1).message;
+      assert.match(delivered.content, /id="bg001"/);
+      assert.match(delivered.content, /outcome="exit"/);
+      assert.match(delivered.content, /sibling-safe/);
+
+      // The job file must carry the real outcome even when the session was busy.
+      const details = delivered.details;
+      const jobPath = join(root, "sessions", details.sessionKey, "instances", details.instanceId, "jobs", "bg001.json");
+      const job = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(job.status, "exited");
+      assert.equal(job.outcome, "exit");
+      assert.equal(job.delivered, true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("completion arrives when a descendant inherits the command's stdout", async () => {
+  // `sleep 30 &` keeps the inherited stdout/stderr write ends open long after bash
+  // exits, so Node never emits `close`. Completion must fire on `exit` plus the
+  // idle grace, not after the descendant finishes.
+  const mock = await createBgMock(script(
+    bg("sleep 30 & echo descendant-started"),
+    text("initial turn complete"),
+    text("saw descendant-started result"),
+  ));
+
+  try {
+    const events = await mock.run("start a command whose descendant holds stdout", TIMEOUT);
+    assert.match(JSON.stringify(events), /Bash job bg001 started in background/);
+
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), 10_000);
+    const textReq = backgroundResultText(request);
+    assert.match(textReq, /id="bg001"/);
+    assert.match(textReq, /outcome="exit"/);
+    assert.match(textReq, /exit_code="0"/);
+    assert.match(textReq, /descendant-started/);
+  } finally {
+    await mock.close();
+  }
+});
+
+test("startup sweep re-delivers an undelivered completion exactly once and records lost jobs honestly", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-reconcile-${process.pid}-${Date.now()}-`));
+  const root = join(dir, "pbb");
+  const sessionId = "sweep-session";
+  const sessionFile = join(dir, "sweep.jsonl");
+  const sessionKey = pbbKeyFor(sessionFile, sessionId);
+  const instanceId = "dead-instance";
+  const instanceDir = join(root, "sessions", sessionKey, "instances", instanceId);
+  const jobsDir = join(instanceDir, "jobs");
+  const logsDir = join(instanceDir, "logs");
+  mkdirSync(jobsDir, { recursive: true });
+  mkdirSync(logsDir, { recursive: true });
+
+  const completedAt = new Date().toISOString();
+  const completedJob = {
+    schemaVersion: 1,
+    jobId: "bg007",
+    globalJobId: `${instanceId}:bg007`,
+    command: "bun test",
+    status: "exited",
+    outcome: "exit",
+    exitCode: 0,
+    startedAt: completedAt,
+    completedAt,
+    durationMs: 1234,
+    sessionId,
+    sessionKey,
+    instanceId,
+    delivered: false,
+    logPath: join(logsDir, "bg007.log"),
+  };
+  writeFileSync(join(jobsDir, "bg007.json"), JSON.stringify(completedJob));
+  writeFileSync(join(logsDir, "bg007.log"), "SWEEP_LOG_TAIL all tests passed\n");
+
+  const gonePid = await deadPid();
+  const stuckJob = {
+    schemaVersion: 1,
+    jobId: "bg008",
+    globalJobId: `${instanceId}:bg008`,
+    command: "sleep 600",
+    status: "running",
+    outcome: "running",
+    exitCode: null,
+    startedAt: new Date(Date.now() - 60_000).toISOString(),
+    sessionId,
+    sessionKey,
+    instanceId,
+    pid: gonePid,
+    pgid: gonePid,
+    logPath: join(logsDir, "bg008.log"),
+  };
+  writeFileSync(join(jobsDir, "bg008.json"), JSON.stringify(stuckJob));
+  writeFileSync(join(logsDir, "bg008.log"), "STUCK_JOB_TAIL waiting for input\n");
+
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId, sessionFile });
+  // A job's *start* tool result also carries details.jobId (nested under
+  // message.details). That must not count as "already delivered", or the sweep
+  // would skip every job the session had started before it went down.
+  session.entries.push({
+    type: "message",
+    id: "start-result-bg007",
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    message: {
+      role: "toolResult",
+      toolCallId: "call-7",
+      toolName: "bash",
+      content: [{ type: "text", text: "Bash job bg007 started in background." }],
+      details: { jobId: "bg007", command: "bun test", outcome: "running", exitCode: null, toolCallId: "call-7" },
+    },
+  });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      await waitForCondition(() => session.messages.length > 0, 10_000);
+
+      // One coalesced message for both jobs, not one message (and one forced turn) each.
+      assert.equal(session.messages.length, 1);
+      const content = session.messages[0].message.content;
+      assert.match(content, /kind="background_bash_digest"/);
+      assert.match(content, /\[bg007\] outcome=exit exit_code=0/);
+      assert.match(content, /SWEEP_LOG_TAIL/);
+      assert.match(content, /bun test/);
+      assert.match(content, /\[bg008\] outcome=lost/);
+      assert.match(content, /STUCK_JOB_TAIL/);
+
+      const deliveredJob = JSON.parse(readFileSync(join(jobsDir, "bg007.json"), "utf8"));
+      assert.equal(deliveredJob.status, "exited");
+      assert.equal(deliveredJob.outcome, "exit");
+      assert.equal(deliveredJob.delivered, true);
+      assert.equal(deliveredJob.deliveredReason, "reconcile");
+
+      // Never fabricate an exit for a job whose owner died: record the real state.
+      const lostJob = JSON.parse(readFileSync(join(jobsDir, "bg008.json"), "utf8"));
+      assert.equal(lostJob.status, "lost");
+      assert.equal(lostJob.outcome, "lost");
+      assert.equal(lostJob.exitCode, null);
+      assert.equal(lostJob.delivered, true);
+
+      const events = readFileSync(join(instanceDir, "events.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.ok(events.some((event) => event.type === "job.lost" && event.jobId === "bg008"));
+      assert.ok(events.every((event) => !(event.type === "job.completed" && event.jobId === "bg008")));
+
+      // A later session start (resume) must not re-deliver anything.
+      await session.emit("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.equal(session.messages.length, 1, "reconcile must re-deliver exactly once");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("reconcile ignores jobs recorded for another session key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-reconcile-scope-${process.pid}-${Date.now()}-`));
+  const root = join(dir, "pbb");
+  const sessionId = "own-session";
+  const sessionFile = join(dir, "own.jsonl");
+  const sessionKey = pbbKeyFor(sessionFile, sessionId);
+  // A job physically inside our session directory but stamped with another key.
+  const jobsDir = join(root, "sessions", sessionKey, "instances", "foreign", "jobs");
+  mkdirSync(jobsDir, { recursive: true });
+  writeFileSync(join(jobsDir, "bg001.json"), JSON.stringify({
+    schemaVersion: 1,
+    jobId: "bg001",
+    command: "FOREIGN_SESSION_JOB",
+    status: "exited",
+    outcome: "exit",
+    exitCode: 0,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    sessionId: "other-session",
+    sessionKey: "other-key",
+    instanceId: "foreign",
+    delivered: false,
+  }));
+
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId, sessionFile });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(session.messages.length, 0, "results must never cross session keys");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("pbb is on PATH inside bash commands and reports the owning session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-path-${process.pid}-${Date.now()}-`));
+  const env = {
+    PBB_ROOT: join(dir, "pbb"),
+    PI_LANE_SESSION_ID: "session-path-test",
+    PI_LANE_SESSION_KEY: "session-key-path-test",
+    PI_LANE_SESSION_FILE: join(dir, "session.jsonl"),
+    PI_LANE_INSTANCE_ID: "instance-path-test",
+    PI_LANE_CURRENT_LANE: "main",
+  };
+  const mock = await createBgMock(script(
+    bg("command -v pbb >/dev/null && pbb self"),
+    text("initial turn complete"),
+    text("saw pbb self"),
+  ), { cwd: dir, env });
+
+  try {
+    await mock.run("check pbb availability inside bash", TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("pbb.self"), TIMEOUT);
+    const textReq = backgroundResultText(request);
+    assert.match(textReq, /outcome="exit"/);
+    assert.match(textReq, /exit_code="0"/);
+    assert.match(textReq, /session-key-path-test/);
+  } finally {
+    await mock.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reconcile does not re-deliver a completion the transcript already carries", async () => {
+  // Upgrade path: files written by the pre-fix build have no `delivered` field, so
+  // the sweep must trust the transcript instead of replaying seen results.
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-reconcile-seen-${process.pid}-${Date.now()}-`));
+  const root = join(dir, "pbb");
+  const sessionId = "seen-session";
+  const sessionFile = join(dir, "seen.jsonl");
+  const sessionKey = pbbKeyFor(sessionFile, sessionId);
+  const jobsDir = join(root, "sessions", sessionKey, "instances", "legacy", "jobs");
+  mkdirSync(jobsDir, { recursive: true });
+  writeFileSync(join(jobsDir, "bg004.json"), JSON.stringify({
+    schemaVersion: 1,
+    jobId: "bg004",
+    command: "make build",
+    status: "exited",
+    outcome: "exit",
+    exitCode: 0,
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    sessionId,
+    sessionKey,
+    instanceId: "legacy",
+  }));
+
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId, sessionFile });
+  session.entries.push({
+    type: "custom_message",
+    id: "already-delivered-bg004",
+    parentId: null,
+    customType: "background_bash_result",
+    content: '<pi_context source="pi-background-bash" kind="background_bash_result" id="bg004" outcome="exit" exit_code="0">ok</pi_context>',
+    details: { jobId: "bg004", command: "make build", outcome: "exit", exitCode: 0 },
+  });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(session.messages.length, 0, "an already-delivered completion must not be re-delivered");
+      const job = JSON.parse(readFileSync(join(jobsDir, "bg004.json"), "utf8"));
+      assert.equal(job.delivered, true);
+      assert.equal(job.deliveredReason, "already_in_session_history");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

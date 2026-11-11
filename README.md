@@ -11,6 +11,15 @@ As of v1, PBB-owned execution is the baseline: jobs are recorded with logs plus 
 
 When a background command finishes, the extension injects a follow-up result into the session and wakes the agent.
 
+## Reliability
+
+A completion is never dropped silently. Four mechanisms keep that true:
+
+- **Per-session ownership.** pi caches the extension factory per cwd, so one loaded module serves every session in a pi process. Job tracking, shutdown state, and the pending-jobs widget are per session; a sibling session's `/new`, `/resume`, `/reload`, subagent finish, or quit kills only *its own* jobs.
+- **Never-drop finalization.** The job file is finalized with the real outcome *before* any delivery attempt. If the session is shutting down (or `sendMessage` throws), the file records `delivered: false` plus a `droppedReason` instead of staying at `status: "running"`.
+- **`exit` + idle grace.** A detached descendant that inherits stdout/stderr keeps Node's `close` from ever firing, so completion waits for the child's `exit` plus an idle grace that is re-armed on every output chunk (same approach as pi core's `waitForChildProcess`, earendil-works/pi#5303). A verbose descendant cannot truncate the tail; a silent one releases completion after the grace.
+- **Reconcile digest.** On every `session_start`, undelivered completions recorded for *this* session are re-delivered as a single coalesced message (`kind="background_bash_digest"`), and stuck `status: "running"` jobs whose owner process is gone are finalized as `outcome: "lost"` — never fabricated as an exit. Jobs older than 24h are not re-delivered (they are marked with a reason), and at most 20 entries go into one digest; the rest are deferred to the next session start.
+
 ## Fork notice
 
 This is a **maintained fork** of [`sshkeda/pi-background-bash`](https://github.com/sshkeda/pi-background-bash) with two fixes:
@@ -105,6 +114,12 @@ pbb kill bg001
 
 `pbb` is designed for agents: output is wrapped in compact `pi_context` envelopes and always includes session/instance identity. Local job IDs are fixed-width strings such as `bg001`, `bg002`, and `bg010` so listings sort chronologically. `pbb` uses [`pi-lane`](https://github.com/sshkeda/pi-lane) runtime identity env vars (`PI_LANE_SESSION_KEY`, `PI_LANE_INSTANCE_ID`, etc.) and defaults to the current live Pi instance, not every terminal attached to the same session.
 
+`pbb` does not need to be on your login-shell PATH. Every command the extension spawns gets
+`~/.pi/pbb/bin` prepended to `PATH`, where the extension maintains a small `pbb` shim pointing at
+its own `bin/pbb.js`; per-session `PBB_*`/`PI_LANE_SESSION_*` identity is passed to that command
+only, so `pbb` inside a bash call reports the session that started the job even when several
+sessions share one pi process. (`PBB_ROOT` overrides the state root — including that `bin` dir.)
+
 Background job state is stored under:
 
 ```text
@@ -166,7 +181,12 @@ npm run typecheck
 npm test
 ```
 
-This repo uses Lefthook for local pre-commit checks. The test suite uses [`pi-mock`](https://github.com/sshkeda/pi-mock) to exercise the extension against a real Pi process.
+The test suite runs with `--test-concurrency=4` so a test run never saturates the machine. It uses
+[`pi-mock`](https://github.com/sshkeda/pi-mock) to exercise the extension against a real Pi process,
+plus in-process tests that invoke the extension factory twice to model two sessions sharing one
+module instance (that shared state is what used to drop completions).
+
+This repo uses Lefthook for local pre-commit checks (`npm run hooks:install`).
 
 ## License
 
