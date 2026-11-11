@@ -142,6 +142,14 @@ type SessionState = {
 	activeJobs: Map<string, ActiveJob>;
 	shuttingDown: boolean;
 	jobNumberFloor: number;
+	/**
+	 * Weak handle on this session's session manager. pi-subagents runs child sessions
+	 * in-process but tears them down with `AgentSession.dispose()`, which only
+	 * invalidates the extension runner — no `session_shutdown` ever fires for them. A
+	 * child's state therefore has to be pruned by liveness, or the registry grows with
+	 * every subagent run.
+	 */
+	sessionRef?: WeakRef<object>;
 };
 
 type BackgroundBashConfig = {
@@ -1438,6 +1446,23 @@ function stopKillRequestPollingIfIdle(): void {
 	killRequestTimer = undefined;
 }
 
+/**
+ * Drop state for sessions that were torn down without a `session_shutdown` —
+ * in-process subagent sessions (`AgentSession.dispose()`) among them. Only
+ * sessions whose session manager has been collected and which own no jobs are
+ * removed, so a live session can never be pruned.
+ */
+function pruneDeadSessions(current: SessionState): void {
+	for (const session of [...liveSessions]) {
+		if (session === current || session.activeJobs.size > 0 || !session.sessionRef) continue;
+		if (session.sessionRef.deref() !== undefined) continue;
+		session.shuttingDown = true;
+		session.pending.clear();
+		liveSessions.delete(session);
+	}
+	stopKillRequestPollingIfIdle();
+}
+
 function maxJobNumberOnDisk(dir: string): number {
 	let max = 0;
 	try {
@@ -1516,8 +1541,10 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		session.shuttingDown = false;
+		session.sessionRef = new WeakRef(ctx.sessionManager as object);
 		session.identity = pbbIdentity(ctx, session.id);
 		session.jobNumberFloor = Math.max(session.jobNumberFloor, sessionJobNumberFloor(ctx));
+		pruneDeadSessions(session);
 		if (ctx.hasUI) session.pending.attach(ctx.ui);
 		repairDetachedBackgroundToolResults(ctx, undefined, { rewriteFile: true });
 		// Re-deliver completions that never reached this session (sibling shutdown,

@@ -187,3 +187,61 @@ forensic capability stays; no re-implementation of bash left.
 **The calculus flipped** vs the first pass: pi-bg-bash's architecture is better, but it
 lacks the one thing that took the 2026-11-11 forensic sweep to find and fix — and that
 thing is exactly what B′ already has.
+
+---
+
+# Corrections (2026-11-11, after verifying pi-subagents + pi 1.4→1.5 in source)
+
+The section above overstated the subagents risk and understated pi's own capability.
+Corrections, in order of importance:
+
+## C1. Subagent teardown does **not** emit `session_shutdown`
+
+pi-subagents tears a child down with `AgentSession.dispose()`, which only calls
+`ExtensionRunner.invalidate()` (`~/.local/share/pi/packages/pi-subagents/src/agent-manager.ts:345-367`).
+`session_shutdown` is emitted only by `AgentSessionRuntime.dispose()`
+(`pi/src/core/agent-session-runtime.ts:172,406`). Child sessions **do** emit
+`session_start` (`agent-runner.ts:1041-1043`) and **do** load extensions in-process
+(`agent-runner.ts:1030`), so `globalThis` and cached factory state are shared — but the
+child never runs the shutdown path.
+
+Consequences, corrected:
+
+- **pbb's original diagnosis named the wrong trigger.** TASK.md's "any sibling
+  session's `session_shutdown` (subagent finishes, /new, /resume, /reload, quit)" —
+  "subagent finishes" is wrong. The drops observed on 2026-11-07 must have come from
+  another shutdown source (`/reload`, a session replacement, or a harness that does use
+  `AgentSessionRuntime`). The fix itself stands and is still needed (never-drop
+  finalization + reconcile + per-session state) — it just is not subagent-triggered.
+- **pi-bg-bash's `endSession()` is not reachable from a subagent**, so the "finishing
+  subagent kills the parent's builds" claim was wrong. `endSession()` only runs on
+  quit/new/resume/fork, where every task in a one-session-at-a-time process does belong
+  to the ending session. What *is* still broken with in-process siblings:
+  `registry.pi` (last loaded wins → the parent's completion is sent through an
+  invalidated child api), `bash_tasks` listing all sessions, and the per-process `nextId`.
+  Narrower than stated — delivery routing, not task killing.
+- **Our extension had a real leak from this**: per-session state is created on
+  `session_start` but nothing ever removes a subagent's state (no shutdown). Fixed
+  2026-11-11 with a `WeakRef` on `ctx.sessionManager` pruned at `session_start`
+  (`pruneDeadSessions`), which cannot touch a live session or one with running jobs.
+
+## C2. pi 1.5 is **not** required for the seam
+
+`BashOperations` and `createBashToolDefinition`/`BashToolOptions` are identical between
+1.4.0 and 1.5.0 (only `createBashTool`'s return type changed), and there is no
+"output events" API in pi at all — `bash_watch` is pi-bg-bash's own tool on
+1.4-compatible APIs. The single 1.5-only thing pi-bg-bash uses is
+`ctx.ui.custom({ block: … })` for the `/bg` picker's program status
+(`pi/src/core/extensions/types.ts:242-246`). So its "Pi 1.5.0 or later" pin is support
+policy, not a hard dependency, and **option B′ needs no pi bump and no re-verification
+of the nix-config TUI patches**.
+
+## C3. Effect on the decision
+
+- A′ (switch to pi-bg-bash) loses its main justification ("needs pi 1.5"): it would
+  still need our multi-session delivery fix + timed promotion, i.e. patches in someone
+  else's repo, for features pbb will have after B′.
+- B′ (refactor pbb onto the seam) is the cheaper and lower-risk path: no pi bump, keep
+  per-session correctness, job records, CLI, 30 s timer, digest, context guard.
+
+Recommendation unchanged in direction, now with less risk attached: **B′**.

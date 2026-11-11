@@ -114,3 +114,18 @@ shell would be a separate, optional decision for manu.
 - No `git push`, no `npm publish`, no deploy; commit is local only.
 - `pbb` on the login-shell PATH (outside agent bash calls) was deliberately not changed —
   that would be a nix-config edit needing his sign-off.
+
+## Addendum 2026-11-11 (after verifying pi-subagents + pi 1.5 in source)
+
+- **Correction to TASK.md's attribution:** subagent teardown does *not* emit
+  `session_shutdown` (pi-subagents calls `AgentSession.dispose()` → runner invalidate
+  only; pi emits the event only from `AgentSessionRuntime.dispose()`). The 2026-11-07
+  drops therefore came from another shutdown source (`/reload`, session replacement, or
+  a harness using `AgentSessionRuntime`). The fix stands — never-drop finalization,
+  per-session state and the reconcile sweep cover all of those causes — but "subagent
+  finishes kills the parent's jobs" is not the mechanism.
+- **New, from the same check:** child subagent sessions emit `session_start` but never
+  `session_shutdown`, so this extension's per-session state (and the `liveSessions`
+  registry) grew with every subagent run. Fixed with a `WeakRef` on
+  `ctx.sessionManager`, pruned at `session_start` (`pruneDeadSessions`); a session with
+  running jobs or a live manager is never pruned.
