@@ -5,8 +5,8 @@
 // an exact string.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const EXT = new URL("../extensions/background-bash.ts", import.meta.url).pathname;
@@ -199,6 +199,85 @@ test("exec does not hang on a descendant that inherited stdout", async () => {
 		assert.equal(result.exitCode, 0);
 		assert.ok(elapsed < 2500, `exec waited ${elapsed} ms for a descendant holding the pipes`);
 		assert.match(readFileSync(harness.logPath, "utf8"), /inherited-pipe/);
+	} finally {
+		harness.cleanup();
+	}
+});
+
+async function waitUntil(predicate, timeoutMs = 5000) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return true;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	return false;
+}
+
+// A runaway command must not be able to fill the disk: the log write-through
+// stops at `maxLogBytes` and the cap is reported to the caller instead of being
+// written into the file (PLAN §6, Decision 9: the log stays raw command output).
+test("exec stops appending at maxLogBytes and keeps only command bytes in the log", async () => {
+	const { extension } = await loadModules();
+	const harness = createSeam(extension, { maxLogBytes: 64 });
+	try {
+		// A reused log path always starts empty (the seam truncates at spawn); the
+		// cap then owns the file.
+		mkdirSync(dirname(harness.logPath), { recursive: true });
+		writeFileSync(harness.logPath, "stale-from-a-previous-job\n");
+		const result = await harness.seam.exec("head -c 4096 /dev/zero | tr '\\0' 'a'", process.cwd(), {
+			onData: harness.onData,
+		});
+		assert.equal(result.exitCode, 0);
+		const log = readFileSync(harness.logPath);
+		assert.equal(log.length, 64, "the log must stop growing at maxLogBytes");
+		assert.equal(log.toString("utf8"), "a".repeat(64), "the log holds command output only — no cap marker");
+		assert.equal(harness.seam.logBytes, 64);
+		assert.equal(harness.seam.logTruncated, true);
+		// pi's own copy of the output is not capped: the budget is about disk, not
+		// about what the command emitted.
+		assert.equal(Buffer.concat(harness.chunks).length, 4096);
+	} finally {
+		harness.cleanup();
+	}
+});
+
+test("exec reports the cap to the caller once, not per chunk", async () => {
+	const { extension } = await loadModules();
+	const capped = [];
+	const harness = createSeam(extension, { maxLogBytes: 32, onLogCapped: (log) => capped.push(log) });
+	try {
+		await harness.seam.exec("printf '0123456789\\n0123456789\\n0123456789\\n0123456789\\n'", process.cwd(), {
+			onData: harness.onData,
+		});
+		assert.equal(capped.length, 1);
+		assert.deepEqual(capped[0], { bytes: 32, truncated: true });
+	} finally {
+		harness.cleanup();
+	}
+});
+
+// Promotion order: the exit watcher is installed before the job record is
+// written, so a failing record write (ENOSPC/EACCES) cannot orphan the child —
+// it must still finalize and let the job layer deliver the completion.
+test("a throwing job-record write at promotion still detects the exit", async () => {
+	const { extension } = await loadModules();
+	const exits = [];
+	const harness = createSeam(extension, {
+		onPromote: () => {
+			throw new Error("ENOSPC: no space left on device, write");
+		},
+		onExit: (exit) => exits.push(exit),
+	});
+	try {
+		const pending = harness.seam.exec("sleep 0.2; exit 0", process.cwd(), { onData: harness.onData });
+		await waitUntil(() => harness.seam.child !== undefined);
+		assert.doesNotThrow(() => harness.seam.promote());
+		const result = await pending;
+		assert.equal(result.exitCode, 0);
+		assert.equal(harness.seam.promoted, true);
+		assert.ok(await waitUntil(() => exits.length > 0), "the promoted job's exit must still be observed");
+		assert.equal(exits[0].code, 0);
+		assert.equal(exits[0].signalCode, null);
 	} finally {
 		harness.cleanup();
 	}

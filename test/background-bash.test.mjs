@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -442,7 +442,10 @@ test("the job log carries the output from before AND after the promotion", async
   }
 });
 
-test("background log is reset when a job id is reused in a later runtime", async () => {
+test("an existing log consumes its job id, so a restarted runtime never overwrites it", async () => {
+  // A foreground call leaves no job record but does leave a log, and a truncated
+  // result in a transcript points at it. The allocator therefore has to count logs
+  // too: reusing bg001 here would truncate that log at spawn.
   const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 5 });
   const pbbRoot = join(cwd, "pbb");
   const sessionKey = "session-key-reused-log-test";
@@ -460,19 +463,67 @@ test("background log is reset when a job id is reused in a later runtime", async
     PI_LANE_CURRENT_LANE: "main",
   };
   const mock = await createBgMock(script(
-    bg("sleep 0.1; echo fresh-reused-log-output"),
+    bg("sleep 0.1; echo fresh-next-id-output"),
     text("initial turn complete"),
-    text("saw fresh reused log result"),
+    text("saw fresh log result"),
   ), { cwd, env });
 
   try {
-    await mock.run("start a background command after a stale log exists", TIMEOUT);
-    const logPath = join(logDir, "bg001.log");
-    await waitForCondition(() => readFileSync(logPath, "utf8").includes("fresh-reused-log-output"));
-    const log = readFileSync(logPath, "utf8");
-    assert.match(log, /fresh-reused-log-output/);
+    const events = await mock.run("start a background command after a stale log exists", TIMEOUT);
+    assert.match(JSON.stringify(events), /Bash job bg002 started in background\./);
+    const nextLog = join(logDir, "bg002.log");
+    await waitForCondition(() => existsSync(nextLog) && readFileSync(nextLog, "utf8").includes("fresh-next-id-output"));
+    const log = readFileSync(nextLog, "utf8");
+    assert.match(log, /fresh-next-id-output/);
     assert.doesNotMatch(log, /stale-previous-job-output/);
     assert.doesNotMatch(log, /\[pbb: output snapshot replaced\]/);
+    // The log the transcript still references is untouched.
+    assert.equal(readFileSync(join(logDir, "bg001.log"), "utf8"), "stale-previous-job-output\n");
+  } finally {
+    await mock.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a restart with only foreground-call logs on disk allocates an id that collides with none of them", async () => {
+  // Foreground calls consume ids but write no job record; only their logs (and the
+  // transcript that points at them) remember. Deriving the floor from transcripts
+  // alone re-allocated bg001 after a restart and truncated `bg001.log`.
+  const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 5 });
+  const pbbRoot = join(cwd, "pbb");
+  const sessionKey = "session-key-foreground-floor-test";
+  const instanceId = "instance-foreground-floor-test";
+  const instanceDir = join(pbbRoot, "sessions", sessionKey, "instances", instanceId);
+  const logDir = join(instanceDir, "logs");
+  mkdirSync(logDir, { recursive: true });
+  // Two foreground-call logs, no jobs/ directory at all.
+  writeFileSync(join(logDir, "bg001.log"), "foreground-output-one\n");
+  writeFileSync(join(logDir, "bg002.log"), "foreground-output-two\n");
+
+  const env = {
+    PBB_ROOT: pbbRoot,
+    PI_LANE_SESSION_ID: "session-foreground-floor-test",
+    PI_LANE_SESSION_KEY: sessionKey,
+    PI_LANE_SESSION_FILE: join(cwd, "session.jsonl"),
+    PI_LANE_INSTANCE_ID: instanceId,
+    PI_LANE_CURRENT_LANE: "main",
+  };
+  const mock = await createBgMock(script(
+    bg("echo fresh-background-output"),
+    text("initial turn complete"),
+    text("saw fresh background result"),
+  ), { cwd, env });
+
+  try {
+    const events = await mock.run("start a background job after a restart with only foreground logs", TIMEOUT);
+    assert.match(JSON.stringify(events), /Bash job bg003 started in background\./);
+    const freshLog = join(logDir, "bg003.log");
+    await waitForCondition(() => existsSync(freshLog) && readFileSync(freshLog, "utf8").includes("fresh-background-output"));
+    // The foreground logs a transcript may still point at are untouched.
+    assert.equal(readFileSync(join(logDir, "bg001.log"), "utf8"), "foreground-output-one\n");
+    assert.equal(readFileSync(join(logDir, "bg002.log"), "utf8"), "foreground-output-two\n");
+    const job = JSON.parse(readFileSync(join(instanceDir, "jobs", "bg003.json"), "utf8"));
+    assert.equal(job.jobId, "bg003");
   } finally {
     await mock.close();
     rmSync(cwd, { recursive: true, force: true });
@@ -604,6 +655,65 @@ test("pbb shows pi-lane owner liveness and stale status", () => {
     const instances = execFileSync(process.execPath, [PBB_CLI, "instances"], { env, encoding: "utf8" });
     assert.match(instances, /instance=current live=true/);
     assert.match(instances, /instance=stale live=false/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pbb status and pbb tail say the log is capped instead of promising the full output", () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-logcap-${process.pid}-${Date.now()}-`));
+  const pbbRoot = join(dir, "pbb");
+  const instanceDir = join(pbbRoot, "sessions", "logcap-key", "instances", "logcap-instance");
+  const logPath = join(instanceDir, "logs", "bg001.log");
+  mkdirSync(join(instanceDir, "jobs"), { recursive: true });
+  mkdirSync(join(instanceDir, "logs"), { recursive: true });
+  writeFileSync(logPath, "capped-output\n");
+  writeFileSync(join(instanceDir, "jobs", "bg001.json"), JSON.stringify({
+    jobId: "bg001",
+    globalJobId: "logcap-instance:bg001",
+    status: "exited",
+    outcome: "exit",
+    exitCode: 0,
+    command: "runaway command",
+    startedAt: new Date().toISOString(),
+    instanceId: "logcap-instance",
+    logPath,
+    logTruncated: true,
+    logBytes: 104857600,
+    delivered: true,
+  }));
+
+  try {
+    const env = {
+      ...process.env,
+      PBB_PIL_BIN: PIL_CLI,
+      PBB_ROOT: pbbRoot,
+      PI_LANE_SESSION_KEY: "logcap-key",
+      PI_LANE_SESSION_ID: "logcap-session",
+      PI_LANE_SESSION_FILE: join(dir, "session.jsonl"),
+      PI_LANE_INSTANCE_ID: "logcap-instance",
+      PI_LANE_CURRENT_LANE: "main",
+    };
+    // The cap is recorded in the job file only (Decision 9) — the readers have to
+    // say so, otherwise a short tail silently looks like the whole output.
+    const status = execFileSync(process.execPath, [PBB_CLI, "status", "bg001"], { env, encoding: "utf8" });
+    assert.match(status, /log capped at 100 MB/);
+    assert.match(status, /log_truncated="true"/);
+
+    const tail = execFileSync(process.execPath, [PBB_CLI, "tail", "bg001"], { env, encoding: "utf8" });
+    assert.match(tail, /log capped at 100 MB/);
+    assert.match(tail, /the file does not contain the full output/);
+    assert.match(tail, /capped-output/);
+
+    // A job that did not hit the cap says nothing about one.
+    const plainLog = join(instanceDir, "logs", "bg002.log");
+    writeFileSync(plainLog, "plain-output\n");
+    writeFileSync(
+      join(instanceDir, "jobs", "bg002.json"),
+      JSON.stringify({ jobId: "bg002", globalJobId: "logcap-instance:bg002", status: "exited", outcome: "exit", exitCode: 0, command: "small", startedAt: new Date().toISOString(), instanceId: "logcap-instance", logPath: plainLog, delivered: true }),
+    );
+    const plain = execFileSync(process.execPath, [PBB_CLI, "tail", "bg002"], { env, encoding: "utf8" });
+    assert.doesNotMatch(plain, /log capped/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1561,10 +1671,10 @@ test("reconcile does not re-deliver a completion the transcript already carries"
 // pi-mock only sees the model-facing text.
 // ---------------------------------------------------------------------------
 
-function configuredCwd(seconds) {
+function configuredCwd(seconds, extraConfig = {}) {
   const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-seam-${process.pid}-${Date.now()}-`));
   mkdirSync(join(dir, ".pi"), { recursive: true });
-  writeFileSync(join(dir, ".pi", "background-bash.json"), JSON.stringify({ autoBackgroundAfterSeconds: seconds }));
+  writeFileSync(join(dir, ".pi", "background-bash.json"), JSON.stringify({ autoBackgroundAfterSeconds: seconds, ...extraConfig }));
   return dir;
 }
 
@@ -1719,6 +1829,237 @@ test("a truncated foreground result names its job log, which holds the whole out
       const small = await session.bash().execute("call-small", { command: "echo tiny" }, undefined, undefined, session.ctx);
       assert.equal(small.details?.fullOutputPath, undefined);
       assert.deepEqual(logFiles(root), ["bg001.log"], "an untruncated foreground call deletes its log");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+async function loadExtensionModule() {
+  const { createJiti } = await import("jiti");
+  const jiti = createJiti(import.meta.url, { moduleCache: false, interopDefault: false });
+  return jiti.import(EXTENSION_PATH);
+}
+
+test("readLogTail returns exactly N lines when the byte window begins on a line boundary", async () => {
+  const extension = await loadExtensionModule();
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-logtail-${process.pid}-${Date.now()}-`));
+  const path = join(dir, "bg001.log");
+  // Four 7-byte lines ("line-N\n"); the last three are exactly 21 bytes.
+  const content = "line-0\nline-1\nline-2\nline-3\n";
+  writeFileSync(path, content);
+  try {
+    // start = 7, i.e. the first byte of "line-1": a complete line, not a fragment.
+    assert.equal(extension.readLogTail(path, 21), "line-1\nline-2\nline-3\n");
+    // start = 6, i.e. the newline that ended "line-0": only that byte is dropped.
+    assert.equal(extension.readLogTail(path, 22), "line-1\nline-2\nline-3\n");
+    // A window cut inside a line still drops the cut fragment (start = 8).
+    assert.equal(extension.readLogTail(path, 20), "line-2\nline-3\n");
+    // A window covering the whole file is returned verbatim.
+    assert.equal(extension.readLogTail(path, content.length), content);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The tool description is the model's only contract for what it can rely on. It
+// may claim that a *truncated* result names its log file and that a
+// *backgrounded* job has an id `pbb` understands — nothing more: a small
+// foreground result leaves no file behind, and a foreground call has no job id
+// for `pbb tail` to resolve.
+test("the tool description promises no log for every command and no pbb tail for foreground calls", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-description-${process.pid}-${Date.now()}-`));
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "description", sessionFile: join(dir, "description.jsonl") });
+  try {
+    factory(session.api);
+    const tool = session.bash();
+    assert.ok(tool, "the extension must register the bash tool");
+    const description = String(tool.description ?? "");
+
+    // The two claims that are true (PLAN §6).
+    assert.match(description, /a truncated result names the log file/);
+    assert.match(description, /Set background: true[^.]*job id \(usable with pbb status\/tail\)/);
+
+    // The old wording: "the full output of every command is written to its job
+    // log" — false, a small foreground result's log is discarded.
+    assert.doesNotMatch(description, /full output of every command/i);
+    // …and "(also readable with pbb tail)" — false, there is no job id to read.
+    assert.doesNotMatch(description, /readable (with|via) pbb tail/i);
+
+    // A log that hit maxLogBytes is not the full output either, so the log a
+    // truncated result names holds "the command's output", not "the full output".
+    assert.doesNotMatch(description, /log file that holds the full output/i);
+
+    const guidelines = (tool.promptGuidelines ?? []).join("\n");
+    assert.doesNotMatch(guidelines, /full output of every command/i);
+    assert.doesNotMatch(guidelines, /readable (with|via) pbb tail/i);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a job that exceeds maxLogBytes stops logging, records the cap, and says so in the completion", async () => {
+  const dir = configuredCwd(0.2, { maxLogBytes: 4096 });
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "log-cap", sessionFile: join(dir, "cap.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      const result = await session.bash().execute(
+        "call-cap",
+        { command: "head -c 20000 /dev/zero | tr '\\0' 'L'; sleep 0.6; echo AFTER-THE-CAP" },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      const details = result.details;
+      assert.equal(details.outcome, "running", "the call must have been promoted");
+      const instanceDir = join(root, "sessions", details.sessionKey, "instances", details.instanceId);
+      const logPath = join(instanceDir, "logs", "bg001.log");
+      const jobPath = join(instanceDir, "jobs", "bg001.json");
+
+      // The record learns about the cap while the job is still running.
+      await waitForCondition(() => existsSync(jobPath) && readFileSync(jobPath, "utf8").includes("logTruncated"), 5_000);
+      const running = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(running.status, "running");
+      assert.equal(running.logTruncated, true);
+      assert.equal(running.logBytes, 4096);
+      assert.equal(readFileSync(logPath).length, 4096);
+
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+      const completion = session.messages.at(-1).message;
+      assert.equal(completion.details.outcome, "exit");
+      assert.match(completion.content, /Log capped at 4 KB/);
+      assert.doesNotMatch(String(completion.details.body), /AFTER-THE-CAP/, "output past the cap was never logged");
+
+      // Nothing about the cap is written into the log: it stays raw command output.
+      const log = readFileSync(logPath, "utf8");
+      assert.match(log, /^L{4096}$/);
+      const finished = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(finished.outcome, "exit");
+      assert.equal(finished.logTruncated, true);
+      assert.equal(finished.logBytes, 4096);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a failing job-record write at promotion still finalizes and delivers the job", async () => {
+  const dir = configuredCwd(0.2);
+  const root = join(dir, "pbb");
+  const sessionKey = "record-write-fails-key";
+  const instanceId = "record-write-fails-instance";
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "record-write-fails", sessionFile: join(dir, "fails.jsonl") });
+  const previous = {
+    PBB_ROOT: process.env.PBB_ROOT,
+    PI_LANE_SESSION_KEY: process.env.PI_LANE_SESSION_KEY,
+    PI_LANE_INSTANCE_ID: process.env.PI_LANE_INSTANCE_ID,
+  };
+  process.env.PBB_ROOT = root;
+  process.env.PI_LANE_SESSION_KEY = sessionKey;
+  process.env.PI_LANE_INSTANCE_ID = instanceId;
+  // A regular file where the jobs directory belongs: every job-record write fails
+  // (ENOTDIR) exactly like ENOSPC/EACCES would, for the promotion write and for the
+  // completion write alike.
+  const instanceDir = join(root, "sessions", sessionKey, "instances", instanceId);
+  mkdirSync(instanceDir, { recursive: true });
+  writeFileSync(join(instanceDir, "jobs"), "not a directory\n");
+
+  try {
+    factory(session.api);
+    await session.emit("session_start");
+    const result = await session.bash().execute(
+      "call-record-fails",
+      { command: "echo early-line; sleep 0.5; echo LATE-LINE" },
+      undefined,
+      undefined,
+      session.ctx,
+    );
+    // The call still became a job …
+    assert.equal(result.details.outcome, "running");
+    assert.match(resultText(result), /Bash job bg001 moved to background/);
+
+    // … and the exit is still detected, recorded as far as possible and delivered.
+    assert.ok(
+      await waitForCondition(() => session.messages.length > 0, 15_000),
+      "the completion never arrived after the record write failed",
+    );
+    const completion = session.messages.at(-1).message;
+    assert.equal(completion.details.outcome, "exit");
+    assert.equal(completion.details.exitCode, 0);
+    assert.equal(completion.details.jobId, "bg001");
+    assert.match(completion.content, /LATE-LINE/);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session start deletes job logs past the retention window, but never a running or undelivered job's", async () => {
+  const dir = configuredCwd(30);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "log-retention", sessionFile: join(dir, "retention.jsonl") });
+  const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      const result = await session.bash().execute(
+        "call-retention",
+        { command: "echo delivered-job-output", background: true },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      const details = result.details;
+      const instanceDir = join(root, "sessions", details.sessionKey, "instances", details.instanceId);
+      const deliveredLog = join(instanceDir, "logs", "bg001.log");
+      const jobPath = join(instanceDir, "jobs", "bg001.json");
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+      assert.equal(JSON.parse(readFileSync(jobPath, "utf8")).delivered, true);
+
+      // An undelivered completion of the same age: its log is the only copy.
+      const undeliveredLog = join(instanceDir, "logs", "bg002.log");
+      const undeliveredJob = {
+        schemaVersion: 1,
+        jobId: "bg002",
+        globalJobId: `${details.instanceId}:bg002`,
+        command: "echo never-delivered",
+        status: "exited",
+        outcome: "exit",
+        exitCode: 0,
+        startedAt: eightDaysAgo.toISOString(),
+        completedAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+        delivered: false,
+        sessionKey: details.sessionKey,
+        instanceId: details.instanceId,
+        logPath: undeliveredLog,
+      };
+      writeFileSync(undeliveredLog, "never-delivered-output\n");
+      writeFileSync(join(instanceDir, "jobs", "bg002.json"), JSON.stringify(undeliveredJob));
+
+      utimesSync(deliveredLog, eightDaysAgo, eightDaysAgo);
+      utimesSync(undeliveredLog, eightDaysAgo, eightDaysAgo);
+
+      // A fresh runtime for the same session: its session_start prunes.
+      const next = createFakeSession({ cwd: dir, sessionId: "log-retention", sessionFile: join(dir, "retention.jsonl") });
+      factory(next.api);
+      await next.emit("session_start");
+
+      assert.equal(existsSync(deliveredLog), false, "a delivered job log past the window is deleted");
+      assert.equal(existsSync(undeliveredLog), true, "an undelivered job's log is kept");
+      assert.equal(readFileSync(undeliveredLog, "utf8"), "never-delivered-output\n");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

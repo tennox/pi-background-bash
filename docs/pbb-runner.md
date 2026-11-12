@@ -26,6 +26,20 @@ Delivery bookkeeping is recorded on the file:
 | `droppedReason` | `session_shutdown`, `send_failed: …` — the completion was recorded but could not be delivered; the reconcile sweep re-delivers it |
 | `deferredReason` | `reconcile_capped` — deferred to the next session start |
 | `lostReason` | set when the owner process died before recording a completion; the outcome is `lost` and is **never** fabricated as `exit` |
+| `logBytes` | bytes the log holds; stops growing at `maxLogBytes` |
+| `logTruncated` | `true` once the log hit `maxLogBytes` and appending stopped |
+
+## Log hygiene
+
+A job's log stops growing at `maxLogBytes` (default 100 MB, see the README's
+configuration section). The cap is recorded **only** in the job file as
+`logTruncated: true` plus `logBytes` — never as a marker line inside the log, because the
+log is the command's own bytes and nothing else. The fact is surfaced in the job's
+completion message, in `pbb status`, and in `pbb tail`.
+
+At `session_start` the extension deletes this session's job logs older than 7 days, except
+logs whose job is still running or whose completion was never delivered (that record is the
+only copy of output the agent has not seen yet).
 
 A job file must never stay at `status: "running"` after its command ended. `delivered: false` with a
 `droppedReason` is the honest record of a notification that could not be delivered in-process.

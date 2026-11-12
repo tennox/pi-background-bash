@@ -19,6 +19,12 @@ const MAX_ACTIVE_JOBS = 10;
 const MAX_RESULT_LINES = DEFAULT_MAX_LINES;
 const MAX_RESULT_BYTES = DEFAULT_MAX_BYTES;
 const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 30;
+// A job's log stops growing at this many bytes (PLAN §6/§10): a runaway command
+// must not be able to fill the disk. The cap is recorded in the job file, never
+// written into the log itself (Decision 9: logs stay raw).
+const DEFAULT_MAX_LOG_BYTES = 100 * 1024 * 1024;
+// Job logs older than this are deleted at `session_start` (PLAN §6).
+const JOB_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const CUSTOM_TYPE = "background_bash_result";
 // How long a process group gets to honour SIGTERM before SIGKILL, on abort and
 // on timeout.
@@ -105,6 +111,10 @@ type ActiveJob = {
 	pbb?: PbbIdentity;
 	/** Canonical full-output file; every chunk of the command is written here. */
 	logPath?: string;
+	/** Bytes the log holds (at most the configured `maxLogBytes`). */
+	logBytes?: number;
+	/** The log stopped at `maxLogBytes`; recorded here, never written into the log. */
+	logTruncated?: boolean;
 	/** The call crossed the threshold (or asked for `background: true`). */
 	promoted?: boolean;
 	/** Something asked this job to stop: `pbb kill` or session shutdown. */
@@ -148,6 +158,7 @@ type SessionState = {
 
 type BackgroundBashConfig = {
 	autoBackgroundAfterSeconds?: number;
+	maxLogBytes?: number;
 };
 
 const JOB_ID_PREFIX = "bg";
@@ -186,22 +197,45 @@ function formatDuration(ms: number): string {
 	return `${(ms / 1000).toFixed(1)}s`;
 }
 
+function formatBytes(bytes: number): string {
+	if (!Number.isFinite(bytes) || bytes < 0) return "an unknown size";
+	if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`;
+	if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+	return `${bytes} bytes`;
+}
+
 function readConfigFile(path: string): BackgroundBashConfig {
 	try {
 		if (!existsSync(path)) return {};
 		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
 		if (!parsed || typeof parsed !== "object") return {};
-		const raw = (parsed as { autoBackgroundAfterSeconds?: unknown }).autoBackgroundAfterSeconds;
-		return typeof raw === "number" && Number.isFinite(raw) ? { autoBackgroundAfterSeconds: raw } : {};
+		const raw = parsed as { autoBackgroundAfterSeconds?: unknown; maxLogBytes?: unknown };
+		const config: BackgroundBashConfig = {};
+		if (typeof raw.autoBackgroundAfterSeconds === "number" && Number.isFinite(raw.autoBackgroundAfterSeconds)) {
+			config.autoBackgroundAfterSeconds = raw.autoBackgroundAfterSeconds;
+		}
+		// Only a positive, finite budget is a cap; anything else keeps the default.
+		if (typeof raw.maxLogBytes === "number" && Number.isFinite(raw.maxLogBytes) && raw.maxLogBytes > 0) {
+			config.maxLogBytes = raw.maxLogBytes;
+		}
+		return config;
 	} catch {
 		return {};
 	}
 }
 
-function getAutoBackgroundAfterSeconds(cwd?: string): number {
+function mergedConfig(cwd?: string): BackgroundBashConfig {
 	const globalConfig = readConfigFile(join(homedir(), ".pi-background-bash", "config.json"));
 	const projectConfig = cwd ? readConfigFile(join(cwd, ".pi", "background-bash.json")) : {};
-	return projectConfig.autoBackgroundAfterSeconds ?? globalConfig.autoBackgroundAfterSeconds ?? DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS;
+	return { ...globalConfig, ...projectConfig };
+}
+
+function getAutoBackgroundAfterSeconds(cwd?: string): number {
+	return mergedConfig(cwd).autoBackgroundAfterSeconds ?? DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS;
+}
+
+function getMaxLogBytes(cwd?: string): number {
+	return mergedConfig(cwd).maxLogBytes ?? DEFAULT_MAX_LOG_BYTES;
 }
 
 function formatThreshold(seconds: number): string {
@@ -609,6 +643,10 @@ function writePbbJob(job: ActiveJob, patch: Record<string, unknown> = {}): void 
 		runner: job.runner,
 		killSignal: job.killSignal,
 		logPath: job.logPath ?? join(pbbLogsDir(job.pbb), `${job.id}.log`),
+		...(job.logBytes === undefined ? {} : { logBytes: job.logBytes }),
+		// Only ever a real cap on this job's log — never a marker inside the file
+		// (Decision 9: the log is the command's own bytes, nothing else).
+		...(job.logTruncated ? { logTruncated: true } : {}),
 		lastEventId: job.lastEventId,
 		...patch,
 	});
@@ -692,27 +730,46 @@ function completionBody(output: string, suffix: string): string {
  * The tail of a log file, at most `maxBytes` from its end, starting on a line
  * boundary. Completion and digest bodies are built from this instead of from
  * the (now removed) per-chunk `job.output` events.
+ *
+ * A byte window rarely lands on a line start, so the window is read one byte
+ * early: if that byte is a newline the window begins exactly on a line boundary
+ * and the whole first line is kept. Only a genuinely cut first line is dropped.
+ * (Dropping it unconditionally lost one entire line whenever the window happened
+ * to begin right after a newline.)
  */
-function readLogTail(path: unknown, maxBytes = LOG_TAIL_MAX_BYTES): string {
+export function readLogTail(path: unknown, maxBytes = LOG_TAIL_MAX_BYTES): string {
 	if (typeof path !== "string") return "";
 	let fd: number | undefined;
 	try {
 		const { size } = statSync(path);
 		if (size === 0) return "";
 		const start = Math.max(0, size - maxBytes);
-		const buffer = Buffer.alloc(size - start);
+		// One byte of look-behind tells us whether the window begins on a boundary.
+		const from = start > 0 ? start - 1 : 0;
+		const buffer = Buffer.alloc(size - from);
 		fd = openSync(path, "r");
-		readSync(fd, buffer, 0, buffer.length, start);
+		readSync(fd, buffer, 0, buffer.length, from);
 		const text = buffer.toString("utf8");
-		if (start === 0) return text;
-		// The first line is cut by the byte window: drop it.
-		const newline = text.indexOf("\n");
-		return newline >= 0 ? text.slice(newline + 1) : "";
+		if (from === start) return text;
+		if (buffer[0] !== 0x0a) {
+			// The window starts inside a line: drop the cut fragment.
+			const newline = text.indexOf("\n");
+			return newline >= 0 ? text.slice(newline + 1) : "";
+		}
+		// The window starts on the newline that ended the previous line: drop just
+		// that byte, the first visible line is complete.
+		return text.slice(1);
 	} catch {
 		return "";
 	} finally {
 		if (fd !== undefined) closeSync(fd);
 	}
+}
+
+/** The log stopped at `maxLogBytes`: say so instead of letting a tail look complete. */
+function logCapNotice(job: ActiveJob): string {
+	if (!job.logTruncated) return "";
+	return `Log capped at ${formatBytes(job.logBytes ?? 0)}: output written after that point was not recorded.`;
 }
 
 /** The completion body: the command's own output tail plus how it ended. */
@@ -728,7 +785,8 @@ function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
 					: result.exitCode === null || result.exitCode === 0
 						? ""
 						: `Command exited with code ${result.exitCode}`;
-	return suffix ? completionBody(output, suffix) : output;
+	const notices = [suffix, logCapNotice(job)].filter((line) => line.length > 0).join("\n");
+	return notices ? completionBody(output, notices) : output;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -758,16 +816,27 @@ export interface BashExecOptions {
 	spawnEnv(base: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv;
 	/** `background: true`: promote before the first chunk. */
 	promoteImmediately?: boolean;
+	/** Bytes the log may grow to; appending stops there (default 100 MB). */
+	maxLogBytes?: number;
 	/** The child exists; record pid/pgid and give our own kill paths a handle. */
 	onSpawn?(child: ChildProcess): void;
 	/**
 	 * Promotion, synchronously after the exec resolved with the synthetic
 	 * `{exitCode: 0}`: the job record is written here, so it can never race a
-	 * completion that arrives later.
+	 * completion that arrives later. Exit detection is installed *before* this
+	 * runs, so a throw from the bookkeeping cannot orphan the child.
 	 */
-	onPromote?(elapsedMs: number): void;
+	onPromote?(elapsedMs: number, log: LogStats): void;
+	/** The log reached `maxLogBytes`; appending stopped. */
+	onLogCapped?(log: LogStats): void;
 	/** A promoted call's process is gone; the job layer finalizes the record. */
 	onExit?(exit: PromotedExit): void;
+}
+
+/** How much of the command's output reached the log file. */
+export interface LogStats {
+	bytes: number;
+	truncated: boolean;
 }
 
 export interface BashExec {
@@ -776,6 +845,10 @@ export interface BashExec {
 	promote(): void;
 	readonly promoted: boolean;
 	readonly child: ChildProcess | undefined;
+	/** Bytes written to the log file (at most `maxLogBytes`). */
+	readonly logBytes: number;
+	/** The log hit `maxLogBytes` and appending stopped. */
+	readonly logTruncated: boolean;
 }
 
 /** pi's `resolveTimeoutMs`: same bounds, same error texts. */
@@ -799,6 +872,10 @@ export function createBashExec(options: BashExecOptions): BashExec {
 	let gone = false;
 	let promoted = false;
 	let timedOut = false;
+	/** Bytes actually written to the log file; stops at `maxLogBytes`. */
+	let logBytes = 0;
+	/** The log reached `maxLogBytes`; appending stopped there. */
+	let logTruncated = false;
 	let promote = () => {};
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 	let killHandle: ReturnType<typeof setTimeout> | undefined;
@@ -844,14 +921,29 @@ export function createBashExec(options: BashExecOptions): BashExec {
 		options.onSpawn?.(child);
 
 		// Raw bytes: the Buffer pi's accumulator receives is the Buffer the log
-		// gets. `forwarding` stops the flow into the (by then finished) tool call
-		// at promotion; the log keeps growing either way.
+		// gets — until the log reaches `maxLogBytes`, where appending stops for the
+		// rest of the run (PLAN §6). pi's own copy of the output keeps flowing, so
+		// the cap is a disk budget, never a change in what the command sees.
 		let forwarding = true;
+		const maxLogBytes = options.maxLogBytes ?? DEFAULT_MAX_LOG_BYTES;
 		const write = (chunk: Buffer) => {
-			try {
-				appendFileSync(options.logPath, chunk);
-			} catch {
-				// Log I/O must never swallow the command's output.
+			if (logBytes < maxLogBytes) {
+				const room = maxLogBytes - logBytes;
+				const slice = chunk.length > room ? chunk.subarray(0, room) : chunk;
+				try {
+					appendFileSync(options.logPath, slice);
+					logBytes += slice.length;
+				} catch {
+					// Log I/O must never swallow the command's output.
+				}
+				if (logBytes >= maxLogBytes && !logTruncated) {
+					logTruncated = true;
+					try {
+						options.onLogCapped?.({ bytes: logBytes, truncated: true });
+					} catch {
+						// Bookkeeping must not stop the command.
+					}
+				}
 			}
 			if (forwarding) onData(chunk);
 		};
@@ -891,14 +983,23 @@ export function createBashExec(options: BashExecOptions): BashExec {
 			// model was just told is running.
 			detachSignal();
 			resolveExec?.({ exitCode: 0 });
-			options.onPromote?.(Date.now() - spawnedAt);
-			// From here we own exit detection: pi's destroy-on-settle would cut the
-			// log write-through of a job that is still writing.
+			// Own exit detection is installed BEFORE the job record is written: pi's
+			// destroy-on-settle would cut the log write-through of a job that is still
+			// writing, and a failing record write (ENOSPC/EACCES) must never leave the
+			// child orphaned, unfinalized and undelivered.
 			const jobWaiter = waitForChildExit(child!, { idleGraceMs: JOB_EXIT_STDIO_GRACE_MS });
 			jobWaiter.done.then(
 				(exit) => finishJob(exit),
 				(error) => finishJob({ code: null, signalCode: null }, error),
 			);
+			try {
+				options.onPromote?.(Date.now() - spawnedAt, { bytes: logBytes, truncated: logTruncated });
+			} catch (error) {
+				// The job record is bookkeeping; the completion still has to be delivered.
+				console.error(
+					`[pi-background-bash] job bookkeeping failed after promotion: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		};
 
 		const promise = new Promise<{ exitCode: number }>((resolve, reject) => {
@@ -952,6 +1053,12 @@ export function createBashExec(options: BashExecOptions): BashExec {
 		},
 		get child() {
 			return child;
+		},
+		get logBytes() {
+			return logBytes;
+		},
+		get logTruncated() {
+			return logTruncated;
 		},
 	};
 }
@@ -1138,7 +1245,15 @@ function finishBackgroundJob(session: SessionState, job: ActiveJob, result: JobR
 	session.activeJobs.delete(job.id);
 	session.pending.finish(job.id);
 
-	recordPbbJobCompleted(job, result, cwd, durationMs);
+	try {
+		recordPbbJobCompleted(job, result, cwd, durationMs);
+	} catch (error) {
+		// A failed record write must not swallow the completion: the agent still
+		// gets the result, the reconcile sweep just cannot re-deliver it.
+		console.error(
+			`[pi-background-bash] could not record the completion of ${job.id}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 
 	if (session.shuttingDown) {
 		patchPbbJobFile(job, { delivered: false, droppedReason: "session_shutdown", droppedAt: new Date().toISOString() });
@@ -1267,6 +1382,52 @@ function collectSessionJobFiles(session: SessionState): ReconcileEntry[] {
 		}
 	}
 	return entries;
+}
+
+/**
+ * Delete this session's job logs past the retention window (PLAN §6).
+ *
+ * Never a log whose job is still running or whose completion was never delivered:
+ * that undelivered record is the only copy of the output the agent has not seen.
+ * Logs of foreground calls have no job record at all — they are deleted by age.
+ */
+function pruneOldJobLogs(session: SessionState): void {
+	const id = session.identity;
+	if (!id) return;
+	const instancesDir = join(pbbSessionDir(id), "instances");
+	let instances: string[];
+	try {
+		if (!existsSync(instancesDir)) return;
+		instances = readdirSync(instancesDir);
+	} catch {
+		return;
+	}
+	const cutoff = Date.now() - JOB_LOG_RETENTION_MS;
+	for (const instanceId of instances) {
+		const instanceDir = join(instancesDir, instanceId);
+		const logsDir = join(instanceDir, "logs");
+		let files: string[];
+		try {
+			files = readdirSync(logsDir);
+		} catch {
+			continue;
+		}
+		for (const file of files) {
+			if (!file.endsWith(".log")) continue;
+			const logPath = join(logsDir, file);
+			try {
+				if (statSync(logPath).mtimeMs > cutoff) continue;
+				const record = readJobFile(join(instanceDir, "jobs", `${file.slice(0, -4)}.json`));
+				if (record) {
+					const status = typeof record.status === "string" ? record.status : "unknown";
+					if (!TERMINAL_STATUSES.has(status) || record.delivered !== true) continue;
+				}
+				rmSync(logPath, { force: true });
+			} catch {
+				// A log we cannot inspect stays put: retention is hygiene, not correctness.
+			}
+		}
+	}
 }
 
 function jobTimestamp(job: Record<string, unknown>): number {
@@ -1593,18 +1754,33 @@ function pruneDeadSessions(current: SessionState): void {
 	stopKillRequestPollingIfIdle();
 }
 
-function maxJobNumberOnDisk(dir: string): number {
+/** Highest job number among the `bg<N><suffix>` entries of one directory. */
+function maxJobNumberOnDisk(dir: string, suffix = ".json"): number {
 	let max = 0;
 	try {
 		if (!existsSync(dir)) return 0;
 		for (const item of readdirSync(dir)) {
-			const n = parseJobNumber(item.replace(/\.json$/, ""));
+			if (!item.endsWith(suffix)) continue;
+			const n = parseJobNumber(item.slice(0, -suffix.length));
 			if (n !== undefined) max = Math.max(max, n);
 		}
 	} catch {
 		// Unreadable directory: fall back to the in-memory counter.
 	}
 	return max;
+}
+
+/**
+ * The highest job id this instance has ever used.
+ *
+ * Job records alone are not enough: a foreground call leaves no record but does
+ * leave a log (truncated results name it), and an id is only ever *consumed* — so
+ * the logs count too. Deriving the floor from transcripts instead would miss any
+ * id whose call left no completion message, and re-allocating it would truncate a
+ * log a transcript still points at.
+ */
+function maxJobNumberSeen(id: PbbIdentity): number {
+	return Math.max(maxJobNumberOnDisk(pbbJobsDir(id)), maxJobNumberOnDisk(pbbLogsDir(id), ".log"));
 }
 
 function sessionJobNumberFloor(ctx: RepairableSessionContext): number {
@@ -1634,7 +1810,7 @@ function allocateJobId(session: SessionState, pbb: PbbIdentity | undefined): str
 		return formatJobId(fallbackJobNumber);
 	}
 	const dir = pbbJobsDir(pbb);
-	const next = Math.max(jobNumberByDir.get(dir) ?? 0, maxJobNumberOnDisk(dir), session.jobNumberFloor) + 1;
+	const next = Math.max(jobNumberByDir.get(dir) ?? 0, maxJobNumberSeen(pbb), session.jobNumberFloor) + 1;
 	jobNumberByDir.set(dir, next);
 	session.jobNumberFloor = next;
 	return formatJobId(next);
@@ -1673,8 +1849,17 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		session.shuttingDown = false;
 		session.sessionRef = new WeakRef(ctx.sessionManager as object);
 		session.identity = pbbIdentity(ctx, session.id);
-		session.jobNumberFloor = Math.max(session.jobNumberFloor, sessionJobNumberFloor(ctx));
+		session.jobNumberFloor = Math.max(
+			session.jobNumberFloor,
+			sessionJobNumberFloor(ctx),
+			session.identity ? maxJobNumberSeen(session.identity) : 0,
+		);
 		pruneDeadSessions(session);
+		try {
+			pruneOldJobLogs(session);
+		} catch {
+			// Log retention is hygiene; never let it break session start.
+		}
 		if (ctx.hasUI) session.pending.attach(ctx.ui);
 		repairDetachedBackgroundToolResults(ctx, undefined, { rewriteFile: true });
 		// Re-deliver completions that never reached this session (sibling shutdown,
@@ -1710,7 +1895,12 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		...inner,
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); the full output of every command is written to its job log, and a truncated result names that path (also readable with pbb tail). Set background: true to run immediately in the background and get a job id. Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
+		// Only the two claims that are true: a *truncated* result names its log, and a
+		// *backgrounded* job has an id `pbb` can read (PLAN §6). A small foreground
+		// result leaves no file, and a log that hit `maxLogBytes` is not the whole
+		// output — so neither "every command's output is on disk" nor "foreground
+		// calls are readable with pbb tail" belongs here.
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); a truncated result names the log file that holds the command's output. Set background: true to run immediately in the background and get a job id (usable with pbb status/tail). Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background and gets such a job id; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
 		promptSnippet: `Execute bash commands (ls, grep, find, etc.); timeout is in seconds. Set background: true for long-running non-interactive commands. Commands still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background and wake you with a pi-background-bash result when finished.`,
 		promptGuidelines: [
 			"Use bash with background: true for long-running non-interactive commands such as builds, full test suites, dev servers, watchers, deploys, downloads, or commands you do not need before the next step.",
@@ -1745,6 +1935,7 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
 			const cwd = ctx?.cwd ?? process.cwd();
 			const autoAfterSeconds = getAutoBackgroundAfterSeconds(cwd);
+			const maxLogBytes = getMaxLogBytes(cwd);
 			const immediate = params.background === true;
 
 			if (signal?.aborted) throw new Error("Command aborted");
@@ -1776,7 +1967,9 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 
 			// Promotion ran: the tool call has its answer, so the job record can no
 			// longer race a completion that arrives later.
-			const onPromote = (elapsedMs: number) => {
+			const onPromote = (elapsedMs: number, log: LogStats) => {
+				job.logBytes = log.bytes;
+				job.logTruncated = log.truncated;
 				recordPbbJobStarted(job, cwd, {
 					promotedAt: new Date().toISOString(),
 					promotedAfterSeconds: Math.round(elapsedMs / 100) / 10,
@@ -1805,8 +1998,16 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 
 			const bashExec = createBashExec({
 				logPath: job.logPath,
+				maxLogBytes,
 				spawnEnv: (base) => pbbSpawnEnv(pbb, base),
 				promoteImmediately: immediate,
+				// The cap is a disk budget, not a silence: a running job's record learns
+				// about it as soon as it happens, so `pbb status` can say so.
+				onLogCapped(log: LogStats) {
+					job.logBytes = log.bytes;
+					job.logTruncated = true;
+					if (job.promoted) patchPbbJobFile(job, { logBytes: log.bytes, logTruncated: true });
+				},
 				onSpawn(child) {
 					job.child = child;
 					job.pid = child.pid ?? undefined;

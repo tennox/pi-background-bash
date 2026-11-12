@@ -240,6 +240,13 @@ function printSelf(id, opts) {
   }, json(payload)));
 }
 
+function formatLogCap(job) {
+  if (job?.logTruncated !== true) return "";
+  const bytes = typeof job.logBytes === "number" ? job.logBytes : undefined;
+  const size = bytes === undefined ? "" : ` at ${bytes >= 1048576 ? Math.round(bytes / 1048576) + " MB" : bytes + " bytes"}`;
+  return `log capped${size}; output after the cap was not recorded`;
+}
+
 function formatJob(job) {
   const age = job.startedAt ? `${Math.max(0, Math.round((Date.now() - Date.parse(job.startedAt)) / 1000))}s` : "?";
   const exit = job.exitCode === undefined || job.exitCode === null ? "" : ` exit=${job.exitCode}`;
@@ -287,7 +294,8 @@ function printStatus(id, jobId, opts) {
   }
   const job = result.job;
   if (opts.json) return console.log(json({ kind: "pbb.status", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, job }));
-  console.log(context("pbb.status", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, exit_code: job.exitCode, cursor: job.lastEventId }, json(job)));
+  const cap = formatLogCap(job);
+  console.log(context("pbb.status", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, ...(cap ? { log_truncated: true, log_bytes: job.logBytes } : {}), lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, exit_code: job.exitCode, cursor: job.lastEventId }, `${cap ? `${cap}\n` : ""}${json(job)}`));
 }
 
 function tailText(path, lines, full) {
@@ -310,7 +318,9 @@ function printTail(id, jobId, opts) {
   const logPath = job.logPath || join(logsDir(id, job.instanceId), `${job.jobId}.log`);
   const body = tailText(logPath, opts.lines, opts.full);
   if (opts.json) return console.log(json({ kind: "pbb.tail", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, job, log: body }));
-  console.log(context("pbb.tail", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, cursor: job.lastEventId, lines: opts.full ? "full" : (opts.lines || DEFAULT_TAIL_LINES) }, body || "No log output recorded yet."));
+  const cap = formatLogCap(job);
+  const note = cap ? `${cap} — the file does not contain the full output\n` : "";
+  console.log(context("pbb.tail", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, cursor: job.lastEventId, ...(cap ? { log_truncated: true, log_bytes: job.logBytes } : {}), lines: opts.full ? "full" : (opts.lines || DEFAULT_TAIL_LINES) }, `${note}${body || "No log output recorded yet."}`));
 }
 
 function normalizeSignal(signal) {

@@ -156,6 +156,15 @@ Disable automatic backgrounding while keeping `background: true` available:
 
 You can also override the threshold for a single project with `.pi/background-bash.json` in that project. Project config wins over global config.
 
+| key | default | meaning |
+| --- | --- | --- |
+| `autoBackgroundAfterSeconds` | `30` | move a still-running call to the background; `0` disables automatic backgrounding (`background: true` still works) |
+| `maxLogBytes` | `104857600` (100 MB) | size cap per job log. Appending stops at the cap; the job file records `logTruncated: true` + `logBytes`, and the completion message, `pbb status` and `pbb tail` say the log is capped. Nothing is written into the log itself. |
+
+Job logs older than 7 days are deleted at `session_start`, except for jobs that are still
+running or whose completion was never delivered. Both keys can be set globally and per
+project (project wins).
+
 ## Agent prompt behavior
 
 The extension updates the `bash` tool metadata exposed to models:
