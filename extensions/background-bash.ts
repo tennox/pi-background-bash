@@ -1,28 +1,33 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { AgentToolUpdateCallback, BashToolDetails, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolUpdateCallback, BashOperations, BashToolDetails, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text } from "@earendil-works/pi-tui";
 import { createPiPending, type PiPendingRegistry } from "pi-pending";
+import { type TObject, Type } from "typebox";
+import { type ChildExit, exitCodeFrom, JOB_EXIT_STDIO_GRACE_MS, waitForChildExit } from "../lib/child-exit.ts";
 import { formatTruncationNotice, piContext, truncateContextText } from "./pi-context-utils.ts";
-import { Type } from "typebox";
 
 const MAX_ACTIVE_JOBS = 10;
-const MAX_RESULT_LINES = 2000;
-const MAX_RESULT_BYTES = 50 * 1024;
+// pi's own truncation window (`truncate.ts`): completion bodies are capped the
+// same way pi caps a tool result, so the extension keeps no numbers of its own.
+const MAX_RESULT_LINES = DEFAULT_MAX_LINES;
+const MAX_RESULT_BYTES = DEFAULT_MAX_BYTES;
 const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 30;
 const CUSTOM_TYPE = "background_bash_result";
-// A detached descendant that inherits stdout/stderr keeps Node's `close` from
-// firing even though the command exited. pi core fixed the same bug
-// (utils/child-process.ts, earendil-works/pi#5303) by resolving on `exit` plus an
-// idle grace re-armed on every chunk; pbb uses a slightly longer window than
-// core's 100ms because `pbb tail --full` recovers anything the grace truncates.
-const EXIT_STDIO_GRACE_MS = 750;
+// How long a process group gets to honour SIGTERM before SIGKILL, on abort and
+// on timeout.
+const KILL_GRACE_MS = 500;
+// pi's `MAX_TIMEOUT_MS` (`tools/bash.ts`), which bounds the `timeout` param.
+const MAX_TIMEOUT_MS = 2_147_483_647;
+// How much of a log's tail is read to rebuild a completion body. Four times
+// pi's byte window, so tail truncation still has complete lines to keep.
+const LOG_TAIL_MAX_BYTES = MAX_RESULT_BYTES * 4;
 // Reconcile sweep: only completions this recent are re-delivered. Older ones are
 // marked delivered with a reason so the sweep converges instead of re-messaging.
 const RECONCILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -63,29 +68,11 @@ type BackgroundBashDetails = BashToolDetails & {
 	digestSkipped?: number;
 };
 
-type BashParams = {
-	command: string;
-	timeout?: number;
-	background?: boolean;
+/** How a job ended, as the job layer records it (never a fabricated exit). */
+type JobResult = {
+	outcome: Exclude<Outcome, "running" | "lost">;
+	exitCode: number | null;
 };
-
-type CompletedBashRun =
-	| {
-			status: "success";
-			result: AgentToolResult<BashToolDetails>;
-			body: string;
-			details: BashToolDetails | undefined;
-			outcome: "exit";
-			exitCode: 0;
-	  }
-	| {
-			status: "error";
-			error: unknown;
-			body: string;
-			details: BashToolDetails | undefined;
-			outcome: Outcome;
-			exitCode: number | null;
-	  };
 
 type PbbIdentity = {
 	sessionId?: string;
@@ -113,11 +100,18 @@ type ActiveJob = {
 	session: SessionState;
 	command: string;
 	toolCallId: string;
-	abortController: AbortController;
 	startedAt: number;
 	cwd?: string;
 	pbb?: PbbIdentity;
-	lastLoggedBody?: string;
+	/** Canonical full-output file; every chunk of the command is written here. */
+	logPath?: string;
+	/** The call crossed the threshold (or asked for `background: true`). */
+	promoted?: boolean;
+	/** Something asked this job to stop: `pbb kill` or session shutdown. */
+	abortRequested?: boolean;
+	timeoutSeconds?: number;
+	/** Spawn error text, when the command never started. */
+	errorMessage?: string;
 	lastEventId?: number;
 	child?: ChildProcess;
 	pid?: number;
@@ -156,12 +150,6 @@ type BackgroundBashConfig = {
 	autoBackgroundAfterSeconds?: number;
 };
 
-const schema = Type.Object({
-	command: Type.String({ description: "Bash command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
-	background: Type.Optional(Type.Boolean({ description: "Run immediately in the background and return a job id" })),
-});
-
 const JOB_ID_PREFIX = "bg";
 const JOB_ID_WIDTH = 3;
 
@@ -192,19 +180,6 @@ function normalizeSignal(value: unknown): NodeJS.Signals {
 	const raw = String(value || "TERM").toUpperCase().replace(/^SIG/, "");
 	if (["TERM", "INT", "KILL", "HUP", "QUIT"].includes(raw)) return `SIG${raw}` as NodeJS.Signals;
 	return "SIGTERM";
-}
-
-function getText(result: AgentToolResult<unknown>): string {
-	return result.content
-		.map((part) => {
-			if (part?.type === "text" && typeof part.text === "string") return part.text;
-			try {
-				return JSON.stringify(part);
-			} catch {
-				return String(part);
-			}
-		})
-		.join("\n");
 }
 
 function formatDuration(ms: number): string {
@@ -489,9 +464,12 @@ function assignOrDelete(env: NodeJS.ProcessEnv, key: string, value: string | und
  * into `process.env` at session_start: that was process-wide, so the session that
  * started last made every later spawn (and every `pbb` run inside it) report the
  * wrong session.
+ *
+ * `base` is the environment pi resolved for this call (`getShellEnv()` plus the
+ * `PI_*` session variables) — pbb only adds its own identity on top.
  */
-function pbbSpawnEnv(id: PbbIdentity | undefined): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...process.env };
+function pbbSpawnEnv(id: PbbIdentity | undefined, base: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...(base ?? process.env) };
 	if (id) {
 		env.PBB_ROOT = id.root;
 		env.PBB_SESSION_KEY = id.sessionKey;
@@ -630,55 +608,42 @@ function writePbbJob(job: ActiveJob, patch: Record<string, unknown> = {}): void 
 		pgid: job.pgid,
 		runner: job.runner,
 		killSignal: job.killSignal,
-		logPath: join(pbbLogsDir(job.pbb), `${job.id}.log`),
+		logPath: job.logPath ?? join(pbbLogsDir(job.pbb), `${job.id}.log`),
 		lastEventId: job.lastEventId,
 		...patch,
 	});
 }
 
-function recordPbbJobStarted(job: ActiveJob, cwd: string): void {
+/**
+ * The job record, written when a call becomes a job (promoted, or
+ * `background: true`). The log file itself already exists — the exec layer
+ * writes every chunk into it from the moment the command is spawned.
+ */
+function recordPbbJobStarted(job: ActiveJob, cwd: string, patch: Record<string, unknown> = {}): void {
 	if (!job.pbb) return;
 	job.cwd = cwd;
-	mkdirSync(pbbLogsDir(job.pbb), { recursive: true });
-	writeFileSync(join(pbbLogsDir(job.pbb), `${job.id}.log`), "");
-	job.lastLoggedBody = undefined;
-	appendPbbEvent(job, "job.started", { command: job.command, cwd });
-	writePbbJob(job, { cwd, status: "running", outcome: "running" });
-}
-
-function appendPbbLogDelta(job: ActiveJob, body: string): void {
-	if (!job.pbb || !body || body === job.lastLoggedBody) return;
-	if (job.lastLoggedBody && body.trimEnd() === job.lastLoggedBody.trimEnd()) {
-		job.lastLoggedBody = body;
-		return;
-	}
-	let delta = body;
-	if (job.lastLoggedBody && body.startsWith(job.lastLoggedBody)) {
-		delta = body.slice(job.lastLoggedBody.length);
-	} else if (job.lastLoggedBody) {
-		delta = `\n[pbb: output snapshot replaced]\n${body}`;
-	}
-	job.lastLoggedBody = body;
-	if (!delta) return;
-	mkdirSync(pbbLogsDir(job.pbb), { recursive: true });
-	appendFileSync(join(pbbLogsDir(job.pbb), `${job.id}.log`), delta);
-	appendPbbEvent(job, "job.output", { bytes: Buffer.byteLength(delta) });
-	writePbbJob(job, { status: "running", outcome: "running", updatedAt: new Date().toISOString() });
+	job.runner = "pbb";
+	job.promoted = true;
+	appendPbbEvent(job, "job.promoted", { command: job.command, cwd, ...patch });
+	writePbbJob(job, { cwd, status: "running", outcome: "running", runner: "pbb", ...patch });
 }
 
 /**
  * Persist the real outcome. `delivered` starts false so the reconcile sweep can
  * tell "recorded but never reached the agent" apart from "delivered".
+ *
+ * The log is left untouched: it holds the command's own bytes (Decision 9).
+ * Nothing reconstructs output from events any more — the per-chunk `job.output`
+ * events were 1.3 MB per instance and are gone.
  */
-function recordPbbJobCompleted(job: ActiveJob, completed: CompletedBashRun, cwd: string, durationMs: number): void {
+function recordPbbJobCompleted(job: ActiveJob, result: JobResult, cwd: string, durationMs: number): void {
 	if (!job.pbb) return;
-	appendPbbLogDelta(job, completed.body);
-	appendPbbEvent(job, "job.completed", { outcome: completed.outcome, exitCode: completed.exitCode, durationMs });
+	appendPbbEvent(job, "job.completed", { outcome: result.outcome, exitCode: result.exitCode, durationMs });
 	writePbbJob(job, {
 		cwd,
-		status: completed.outcome === "exit" ? "exited" : completed.outcome,
-		outcome: completed.outcome,
-		exitCode: completed.exitCode,
+		status: result.outcome === "exit" ? "exited" : result.outcome,
+		outcome: result.outcome,
+		exitCode: result.exitCode,
 		completedAt: new Date().toISOString(),
 		durationMs,
 		delivered: false,
@@ -688,7 +653,7 @@ function recordPbbJobCompleted(job: ActiveJob, completed: CompletedBashRun, cwd:
 
 function handlePbbKillRequestsForSession(session: SessionState): void {
 	for (const job of session.activeJobs.values()) {
-		if (!job.pbb) continue;
+		if (!job.pbb || !job.promoted) continue;
 		const dir = pbbRequestsDir(job.pbb);
 		if (!existsSync(dir)) continue;
 		for (const item of readdirSync(dir)) {
@@ -705,7 +670,8 @@ function handlePbbKillRequestsForSession(session: SessionState): void {
 			job.killSignal = normalizeSignal(request.signal);
 			appendPbbEvent(job, "job.kill_requested", { requestId: request.requestId, signal: job.killSignal });
 			writePbbJob(job, { status: "kill_requested", killRequestedAt: new Date().toISOString(), killSignal: job.killSignal, lastEventId: job.lastEventId });
-			job.abortController.abort();
+			job.abortRequested = true;
+			killProcessGroup(job.pgid ?? job.pid, job.killSignal);
 			rmSync(path, { force: true });
 		}
 	}
@@ -718,163 +684,278 @@ function waitForBackgroundThreshold(seconds: number): Promise<"background"> {
 	});
 }
 
-function rethrowBashError(completed: Extract<CompletedBashRun, { status: "error" }>, job?: ActiveJob): never {
-	const body = truncateForegroundBody(job, completed.body);
-	throw new Error(body || (completed.error instanceof Error ? completed.error.message : String(completed.error)));
-}
-
 function completionBody(output: string, suffix: string): string {
 	return output ? `${output.replace(/\s*$/, "")}\n\n${suffix}` : suffix;
 }
 
-async function runPbbBash(
-	job: ActiveJob,
-	cwd: string,
-	params: BashParams,
-	onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
-): Promise<CompletedBashRun> {
-	job.runner = "pbb";
-	return new Promise((resolve) => {
-		let output = "";
-		let settled = false;
-		let timedOut = false;
-		let aborted = false;
-		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-		let graceHandle: ReturnType<typeof setTimeout> | undefined;
-		let exited = false;
-		let exitCode: number | null = null;
-		let exitSignal: NodeJS.Signals | null = null;
-		let stdoutEnded = false;
-		let stderrEnded = false;
+/**
+ * The tail of a log file, at most `maxBytes` from its end, starting on a line
+ * boundary. Completion and digest bodies are built from this instead of from
+ * the (now removed) per-chunk `job.output` events.
+ */
+function readLogTail(path: unknown, maxBytes = LOG_TAIL_MAX_BYTES): string {
+	if (typeof path !== "string") return "";
+	let fd: number | undefined;
+	try {
+		const { size } = statSync(path);
+		if (size === 0) return "";
+		const start = Math.max(0, size - maxBytes);
+		const buffer = Buffer.alloc(size - start);
+		fd = openSync(path, "r");
+		readSync(fd, buffer, 0, buffer.length, start);
+		const text = buffer.toString("utf8");
+		if (start === 0) return text;
+		// The first line is cut by the byte window: drop it.
+		const newline = text.indexOf("\n");
+		return newline >= 0 ? text.slice(newline + 1) : "";
+	} catch {
+		return "";
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
 
-		const child = spawn("bash", ["-lc", params.command], {
-			cwd,
-			env: pbbSpawnEnv(job.pbb),
-			detached: true,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		job.child = child;
-		job.pid = child.pid;
-		job.pgid = child.pid;
-		writePbbJob(job, { pid: child.pid, pgid: child.pid, runner: "pbb" });
+/** The completion body: the command's own output tail plus how it ended. */
+function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
+	const output = readLogTail(job.logPath);
+	const suffix =
+		result.outcome === "timeout"
+			? `Command timed out after ${job.timeoutSeconds} seconds`
+			: result.outcome === "abort"
+				? "Command aborted"
+				: result.outcome === "error"
+					? (job.errorMessage ?? "Command could not be run")
+					: result.exitCode === null || result.exitCode === 0
+						? ""
+						: `Command exited with code ${result.exitCode}`;
+	return suffix ? completionBody(output, suffix) : output;
+}
 
-		const clearGrace = () => {
-			if (graceHandle) clearTimeout(graceHandle);
-			graceHandle = undefined;
-		};
+/* ------------------------------------------------------------------------- *
+ * The exec seam
+ *
+ * `operations.exec` is the only thing this extension supplies to pi's own bash
+ * tool: pi keeps the environment, the output accumulator, truncation, the error
+ * texts and the structured result (PLAN §4/§5). Everything below reproduces
+ * pi's local `createLocalShellOperations` (`tools/bash.ts:97-172`) exactly —
+ * same validation order, same messages, same exit convention — and adds the two
+ * things a background layer needs: a raw-bytes log write-through from spawn, and
+ * promotion, where the call is answered early while the same child keeps
+ * running as a job.
+ * ------------------------------------------------------------------------- */
 
-		const finish = (completed: CompletedBashRun) => {
-			if (settled) return;
-			settled = true;
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			timeoutHandle = undefined;
-			clearGrace();
-			// A descendant may still hold the pipes; we already have the output we are
-			// going to report, so release the handles instead of waiting for `close`.
-			child.stdout?.destroy();
-			child.stderr?.destroy();
-			resolve(completed);
-		};
+export interface PromotedExit extends ChildExit {
+	/** This layer killed the group because the `timeout` param elapsed. */
+	timedOut: boolean;
+	/** The child never started (spawn error); `exit` carries no code. */
+	error?: unknown;
+}
 
-		const complete = () => {
-			if (settled || !exited) return;
-			if (timedOut) {
-				const body = completionBody(output, `Command timed out after ${params.timeout} seconds`);
-				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "timeout", exitCode: null });
-				return;
-			}
-			if (aborted || exitSignal) {
-				const body = completionBody(output, "Command aborted");
-				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "abort", exitCode: null });
-				return;
-			}
-			if (exitCode === 0) {
-				const result: AgentToolResult<BashToolDetails> = { content: output ? [{ type: "text", text: output.replace(/\s*$/, "") }] : [], details: {} as BashToolDetails };
-				finish({ status: "success", result, body: getText(result), details: result.details, outcome: "exit", exitCode: 0 });
-				return;
-			}
-			const code = exitCode ?? 1;
-			const body = completionBody(output, `Command exited with code ${code}`);
-			finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "exit", exitCode: code });
-		};
+export interface BashExecOptions {
+	/** Canonical full-output log for this call: every chunk is written here. */
+	logPath: string;
+	/** pi's spawn env (shell env + `PI_*`) with the pbb identity on top. */
+	spawnEnv(base: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv;
+	/** `background: true`: promote before the first chunk. */
+	promoteImmediately?: boolean;
+	/** The child exists; record pid/pgid and give our own kill paths a handle. */
+	onSpawn?(child: ChildProcess): void;
+	/**
+	 * Promotion, synchronously after the exec resolved with the synthetic
+	 * `{exitCode: 0}`: the job record is written here, so it can never race a
+	 * completion that arrives later.
+	 */
+	onPromote?(elapsedMs: number): void;
+	/** A promoted call's process is gone; the job layer finalizes the record. */
+	onExit?(exit: PromotedExit): void;
+}
 
-		const maybeComplete = () => {
-			if (exited && !settled && stdoutEnded && stderrEnded) complete();
-		};
+export interface BashExec {
+	exec: BashOperations["exec"];
+	/** Resolve the exec as if the command had finished; the child keeps running. */
+	promote(): void;
+	readonly promoted: boolean;
+	readonly child: ChildProcess | undefined;
+}
 
-		// Re-armed on every chunk: a descendant still writing keeps us reading, while
-		// a quiet inherited handle releases us once the grace elapses.
-		const armGrace = () => {
-			clearGrace();
-			graceHandle = setTimeout(() => complete(), EXIT_STDIO_GRACE_MS);
-			graceHandle.unref?.();
-		};
+/** pi's `resolveTimeoutMs`: same bounds, same error texts. */
+function resolveTimeoutMs(timeout: number | undefined): number | undefined {
+	if (timeout === undefined) return undefined;
+	if (!Number.isFinite(timeout) || timeout <= 0) {
+		throw new Error("Invalid timeout: must be a finite number of seconds");
+	}
+	const timeoutMs = timeout * 1000;
+	if (timeoutMs > MAX_TIMEOUT_MS) {
+		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_MS / 1000} seconds`);
+	}
+	return timeoutMs;
+}
 
-		const append = (chunk: Buffer) => {
-			output += chunk.toString("utf8");
-			const text = truncateLiveBody(output.replace(/\s*$/, ""));
-			onUpdate?.({ content: text ? [{ type: "text", text }] : [], details: {} as BashToolDetails });
-			appendPbbLogDelta(job, output);
-			if (exited && !settled) armGrace();
-		};
-		child.stdout?.on("data", append);
-		child.stderr?.on("data", append);
-		child.stdout?.on("end", () => {
-			stdoutEnded = true;
-			maybeComplete();
-		});
-		child.stderr?.on("end", () => {
-			stderrEnded = true;
-			maybeComplete();
-		});
+export function createBashExec(options: BashExecOptions): BashExec {
+	let child: ChildProcess | undefined;
+	/** The exec promise settled (promoted, finished or failed). */
+	let settled = false;
+	/** The process is gone: only then is the SIGKILL escalation pointless. */
+	let gone = false;
+	let promoted = false;
+	let timedOut = false;
+	let promote = () => {};
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	let killHandle: ReturnType<typeof setTimeout> | undefined;
 
-		const abort = () => {
-			aborted = true;
-			killProcessGroup(child.pid, job.killSignal ?? "SIGTERM");
-			setTimeout(() => {
-				if (!settled && job.killSignal !== "SIGKILL") killProcessGroup(child.pid, "SIGKILL");
-			}, 500).unref?.();
-		};
-		if (job.abortController.signal.aborted) abort();
-		else job.abortController.signal.addEventListener("abort", abort, { once: true });
+	const clearTimers = () => {
+		if (timeoutHandle) clearTimeout(timeoutHandle);
+		if (killHandle) clearTimeout(killHandle);
+		timeoutHandle = undefined;
+		killHandle = undefined;
+	};
 
-		if (params.timeout && params.timeout > 0) {
-			timeoutHandle = setTimeout(() => {
-				timedOut = true;
-				killProcessGroup(child.pid, "SIGTERM");
-				setTimeout(() => {
-					if (!settled) killProcessGroup(child.pid, "SIGKILL");
-				}, 500).unref?.();
-			}, params.timeout * 1000);
-			timeoutHandle.unref?.();
+	const terminate = () => {
+		killProcessGroup(child?.pid, "SIGTERM");
+		if (killHandle) clearTimeout(killHandle);
+		killHandle = setTimeout(() => {
+			if (!gone) killProcessGroup(child?.pid, "SIGKILL");
+		}, KILL_GRACE_MS);
+		killHandle.unref?.();
+	};
+
+	const exec: BashOperations["exec"] = async (command, cwd, { onData, signal, timeout, env }) => {
+		// pi's order, pi's messages: validate the timeout, honour an aborted
+		// signal, check the cwd, then spawn.
+		const timeoutMs = resolveTimeoutMs(timeout);
+		if (signal?.aborted) throw new Error("aborted");
+		try {
+			accessSync(cwd, fsConstants.F_OK);
+		} catch {
+			throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`);
 		}
 
-		child.on("error", (error) => {
-			if (settled) return;
-			settled = true;
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			clearGrace();
-			resolve({ status: "error", error, body: error.message, details: undefined, outcome: "error", exitCode: null });
-		});
+		mkdirSync(dirname(options.logPath), { recursive: true });
+		// A reused job id starts with an empty log.
+		writeFileSync(options.logPath, "");
 
-		child.on("exit", (code, signalName) => {
-			exited = true;
-			exitCode = code;
-			exitSignal = signalName;
-			maybeComplete();
-			if (!settled) armGrace();
+		child = spawn("bash", ["-lc", command], {
+			cwd,
+			detached: true,
+			env: options.spawnEnv(env),
+			stdio: ["ignore", "pipe", "pipe"],
 		});
+		const spawnedAt = Date.now();
+		options.onSpawn?.(child);
 
-		child.on("close", (code, signalName) => {
-			if (!exited) {
-				exited = true;
-				exitCode = code;
-				exitSignal = signalName;
+		// Raw bytes: the Buffer pi's accumulator receives is the Buffer the log
+		// gets. `forwarding` stops the flow into the (by then finished) tool call
+		// at promotion; the log keeps growing either way.
+		let forwarding = true;
+		const write = (chunk: Buffer) => {
+			try {
+				appendFileSync(options.logPath, chunk);
+			} catch {
+				// Log I/O must never swallow the command's output.
 			}
-			complete();
+			if (forwarding) onData(chunk);
+		};
+		child.stdout?.on("data", write);
+		child.stderr?.on("data", write);
+
+		const foreground = waitForChildExit(child);
+		const onAbort = () => terminate();
+		let resolveExec: ((value: { exitCode: number }) => void) | undefined;
+		let rejectExec: ((error: unknown) => void) | undefined;
+
+		const detachSignal = () => {
+			signal?.removeEventListener("abort", onAbort);
+		};
+
+		const finishJob = (exit: ChildExit, error?: unknown) => {
+			if (gone) return;
+			gone = true;
+			clearTimers();
+			options.onExit?.({ ...exit, timedOut, ...(error === undefined ? {} : { error }) });
+		};
+
+		promote = () => {
+			// A command that already ended ends normally; promoting it would leave a
+			// job with no exit event left to wait for.
+			if (promoted || settled) return;
+			if (child && (child.exitCode !== null || child.signalCode !== null)) return;
+			promoted = true;
+			settled = true;
+			// Nothing is buffered: every delivered chunk was written to the log and
+			// forwarded to `onData` in the same `data` handler, so the call's answer
+			// is complete up to this instant.
+			foreground.detach();
+			forwarding = false;
+			// The signal belongs to the whole run (one AbortController per run), not
+			// to this call: a listener that survived promotion would kill a job the
+			// model was just told is running.
+			detachSignal();
+			resolveExec?.({ exitCode: 0 });
+			options.onPromote?.(Date.now() - spawnedAt);
+			// From here we own exit detection: pi's destroy-on-settle would cut the
+			// log write-through of a job that is still writing.
+			const jobWaiter = waitForChildExit(child!, { idleGraceMs: JOB_EXIT_STDIO_GRACE_MS });
+			jobWaiter.done.then(
+				(exit) => finishJob(exit),
+				(error) => finishJob({ code: null, signalCode: null }, error),
+			);
+		};
+
+		const promise = new Promise<{ exitCode: number }>((resolve, reject) => {
+			resolveExec = resolve;
+			rejectExec = reject;
 		});
-	});
+
+		foreground.done.then(
+			(exit) => {
+				if (promoted) return; // the job watcher owns this exit
+				settled = true;
+				gone = true;
+				clearTimers();
+				detachSignal();
+				if (signal?.aborted) return rejectExec?.(new Error("aborted"));
+				if (timedOut) return rejectExec?.(new Error(`timeout:${timeout}`));
+				// pi's convention, verbatim: a signal-killed shell has no exit code.
+				resolveExec?.({ exitCode: exitCodeFrom(exit.code, exit.signalCode) });
+			},
+			(error) => {
+				if (promoted) return;
+				settled = true;
+				gone = true;
+				clearTimers();
+				detachSignal();
+				rejectExec?.(error);
+			},
+		);
+
+		if (timeoutMs !== undefined) {
+			timeoutHandle = setTimeout(() => {
+				timedOut = true;
+				terminate();
+			}, timeoutMs);
+			timeoutHandle.unref?.();
+		}
+		// An abort that arrived while the process was being spawned is still an abort.
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+
+		if (options.promoteImmediately) promote();
+
+		return promise;
+	};
+
+	return {
+		exec,
+		promote: () => promote(),
+		get promoted() {
+			return promoted;
+		},
+		get child() {
+			return child;
+		},
+	};
 }
+
 
 function shouldTruncateBody(body: string): boolean {
 	return Boolean(truncateContextText(body, { mode: "tail", maxLines: MAX_RESULT_LINES, maxBytes: MAX_RESULT_BYTES, appendNotice: false }).truncation?.truncated);
@@ -918,33 +999,85 @@ function trimOversizedToolResultsForContext(messages: AgentMessage[]): AgentMess
 	return changed ? next : undefined;
 }
 
-function writeForegroundFullOutput(body: string): string {
-	const dir = join(homedir(), ".pi", "pbb", "truncated");
-	mkdirSync(dir, { recursive: true });
-	const path = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}.log`);
-	writeFileSync(path, body);
-	return path;
-}
-
-function truncateForegroundBody(job: ActiveJob | undefined, body: string): string {
-	if (!shouldTruncateBody(body)) return body;
-	const fullOutputHint = job?.pbb ? `pbb tail ${job.id} --full` : writeForegroundFullOutput(body);
-	return truncateBodyWithHint(body, fullOutputHint);
-}
-
-function truncateLiveBody(body: string): string {
-	if (!shouldTruncateBody(body)) return body;
-	return truncateBodyWithHint(body, "final tool result/full-output snapshot");
-}
-
+/**
+ * A completion body: the log tail, capped exactly like pi caps a tool result,
+ * with the job id as the route to the whole file.
+ */
 function truncateBackgroundBody(job: ActiveJob, body: string): string {
-	const fullOutputHint = job.pbb ? `pbb tail ${job.id} --full` : writeForegroundFullOutput(body);
-	return truncateBodyWithHint(body, fullOutputHint);
+	return truncateBodyWithHint(body, `pbb tail ${job.id} --full`);
 }
 
-function truncateForegroundResult(job: ActiveJob, completed: Extract<CompletedBashRun, { status: "success" }>): AgentToolResult<BashToolDetails> {
-	const body = truncateForegroundBody(job, completed.body);
-	return { content: body ? [{ type: "text", text: body }] : [], details: completed.result.details };
+/** Where a call's full output lives. Job calls: the instance log dir. */
+function logPathFor(job: ActiveJob): string {
+	return job.pbb ? join(pbbLogsDir(job.pbb), `${job.id}.log`) : join(pbbRoot(), "logs", `${job.id}.log`);
+}
+
+/** A foreground call that was neither truncated nor promoted leaves no output file. */
+function discardJobLog(job: ActiveJob): void {
+	if (!job.logPath || job.promoted) return;
+	rmSync(job.logPath, { force: true });
+}
+
+/**
+ * The foreground answer: pi's own result, with the full-output path retargeted
+ * from pi's temp file (which stops growing and is deleted here) to this call's
+ * log, which outlives the call and is what `structuredContent`/codemode reads.
+ */
+function foregroundToolResult(
+	job: ActiveJob,
+	result: AgentToolResult<BashToolDetails | undefined>,
+): AgentToolResult<BashToolDetails | undefined> {
+	const piFullOutputPath = result.details?.fullOutputPath;
+	if (!piFullOutputPath || !job.logPath) {
+		discardJobLog(job);
+		return result;
+	}
+	const logPath = job.logPath;
+	const retarget = (text: string) => text.split(`Full output: ${piFullOutputPath}`).join(`Full output: ${logPath}`);
+	const content: typeof result.content = result.content.map((part) =>
+		part.type === "text" ? { ...part, text: retarget(part.text) } : part,
+	);
+	rmSync(piFullOutputPath, { force: true });
+	const structured = (result as { structuredContent?: Record<string, unknown> }).structuredContent;
+	return {
+		...result,
+		content,
+		details: { ...result.details, fullOutputPath: logPath },
+		...(structured ? { structuredContent: { ...structured, full_output_path: logPath } } : {}),
+	};
+}
+
+/**
+ * The promoted answer: job id, threshold and the log path. `structuredContent`
+ * carries no exit code — the command is still running — and points at the log
+ * instead of pi's temp file, which is frozen at promotion and deleted here.
+ */
+function promotedToolResult(
+	job: ActiveJob,
+	result: AgentToolResult<BashToolDetails | undefined> | undefined,
+	thresholdSeconds: number | undefined,
+): AgentToolResult<BackgroundBashDetails> {
+	const piFullOutputPath = result?.details?.fullOutputPath;
+	if (piFullOutputPath) rmSync(piFullOutputPath, { force: true });
+	const lead =
+		thresholdSeconds === undefined
+			? `Bash job ${job.id} started in background.`
+			: `Bash job ${job.id} moved to background after ${formatThreshold(thresholdSeconds)}.`;
+	const text = `${lead} Full output: ${job.logPath}. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.`;
+	const structured = (
+		result as { structuredContent?: { output?: unknown; truncated?: unknown; wall_time_seconds?: unknown } } | undefined
+	)?.structuredContent;
+	return {
+		content: [{ type: "text", text }],
+		details: runningJobDetails(job, job.cwd ?? process.cwd()),
+		structuredContent: {
+			output: typeof structured?.output === "string" ? structured.output : "",
+			truncated: structured?.truncated === true,
+			full_output_path: job.logPath,
+			job_id: job.id,
+			wall_time_seconds: typeof structured?.wall_time_seconds === "number" ? structured.wall_time_seconds : 0,
+		},
+	} as unknown as AgentToolResult<BackgroundBashDetails>;
 }
 
 function buildXmlResult(job: ActiveJob, outcome: Outcome, exitCode: number | null, durationMs: number, body: string): string {
@@ -1000,12 +1133,12 @@ function sendBackgroundResultFollowUp(session: SessionState, job: ActiveJob, con
  * when this session can still receive it. Never early-return before recording —
  * that is what left job files stuck at `status: "running"` forever.
  */
-function finishBackgroundJob(session: SessionState, job: ActiveJob, completed: CompletedBashRun, cwd: string): void {
+function finishBackgroundJob(session: SessionState, job: ActiveJob, result: JobResult, cwd: string): void {
 	const durationMs = Date.now() - job.startedAt;
 	session.activeJobs.delete(job.id);
 	session.pending.finish(job.id);
 
-	recordPbbJobCompleted(job, completed, cwd, durationMs);
+	recordPbbJobCompleted(job, result, cwd, durationMs);
 
 	if (session.shuttingDown) {
 		patchPbbJobFile(job, { delivered: false, droppedReason: "session_shutdown", droppedAt: new Date().toISOString() });
@@ -1013,14 +1146,16 @@ function finishBackgroundJob(session: SessionState, job: ActiveJob, completed: C
 		return;
 	}
 
-	const body = truncateBackgroundBody(job, completed.body);
-	const content = buildXmlResult(job, completed.outcome, completed.exitCode, durationMs, body);
+	// The completion body comes from the log file, not from a buffered copy: the
+	// log is the canonical output and is still the only thing that survives a
+	// `/reload` (PLAN §6).
+	const body = truncateBackgroundBody(job, completionBodyFromLog(job, result));
+	const content = buildXmlResult(job, result.outcome, result.exitCode, durationMs, body);
 	const details: BackgroundBashDetails = {
-		...(completed.details ?? {}),
 		jobId: job.id,
 		command: job.command,
-		outcome: completed.outcome,
-		exitCode: completed.exitCode,
+		outcome: result.outcome,
+		exitCode: result.exitCode,
 		toolCallId: job.toolCallId,
 		startedAt: new Date(job.startedAt).toISOString(),
 		durationMs,
@@ -1141,15 +1276,10 @@ function jobTimestamp(job: Record<string, unknown>): number {
 }
 
 function tailOfLog(path: unknown, lines = RECONCILE_LOG_TAIL_LINES): string {
-	if (typeof path !== "string") return "";
-	try {
-		if (!existsSync(path)) return "";
-		const text = readFileSync(path, "utf8");
-		const wanted = text.split(/\r?\n/).filter((line, index, all) => line.length > 0 || index < all.length - 1).slice(-lines);
-		return wanted.join("\n").slice(-1600);
-	} catch {
-		return "";
-	}
+	const text = readLogTail(path);
+	if (!text) return "";
+	const wanted = text.split(/\r?\n/).filter((line, index, all) => line.length > 0 || index < all.length - 1).slice(-lines);
+	return wanted.join("\n").slice(-1600);
 }
 
 function formatDigestEntry(entry: ReconcileEntry): string {
@@ -1411,8 +1541,8 @@ function runningJobDetails(job: ActiveJob, cwd: string): BackgroundBashDetails {
 function abortSessionJobs(session: SessionState): void {
 	session.shuttingDown = true;
 	for (const job of session.activeJobs.values()) {
-		job.abortController.abort();
-		if (job.runner === "pbb") killProcessGroup(job.pgid ?? job.pid, "SIGTERM");
+		job.abortRequested = true;
+		killProcessGroup(job.pgid ?? job.pid, job.killSignal ?? "SIGTERM");
 	}
 	session.activeJobs.clear();
 	session.pending.clear();
@@ -1572,10 +1702,15 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		if (messages) return { messages };
 	});
 
+	// pi's own bash tool, driven by our `operations.exec` (PLAN §5). The factory
+	// gets no session context, so `process.cwd()` is only the registration-time
+	// fallback — `execute` resolves the call's real cwd (`ctx.cwd`) and builds the
+	// delegate per call, which is also where the per-call exec state lives.
+	const inner = createBashToolDefinition(process.cwd());
+
 	pi.registerTool({
-		name: "bash",
-		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Verbose background results are truncated with the full output available through pbb tail. Set background: true to run immediately in the background and get a job id. Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
+		...inner,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); the full output of every command is written to its job log, and a truncated result names that path (also readable with pbb tail). Set background: true to run immediately in the background and get a job id. Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
 		promptSnippet: `Execute bash commands (ls, grep, find, etc.); timeout is in seconds. Set background: true for long-running non-interactive commands. Commands still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background and wake you with a pi-background-bash result when finished.`,
 		promptGuidelines: [
 			"Use bash with background: true for long-running non-interactive commands such as builds, full test suites, dev servers, watchers, deploys, downloads, or commands you do not need before the next step.",
@@ -1586,146 +1721,146 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 			"A <pi_context source=\"pi-background-bash\" kind=\"background_bash_digest\"> message lists background completions that were recorded while no live session could receive them; treat every entry as a final result (an entry with outcome=lost has an unknown outcome — inspect its log instead of assuming success).",
 			"Do not use bash for interactive commands that require stdin unless the user explicitly asks for that behavior.",
 		],
-		parameters: schema,
-		async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
-			const autoAfterSeconds = getAutoBackgroundAfterSeconds(ctx.cwd);
+		parameters: Type.Object({
+			...inner.parameters.properties,
+			background: Type.Optional(Type.Boolean({ description: "Run immediately in the background and return a job id" })),
+		}),
+		// pi's fields plus ours: a promoted call has no exit code yet, and every
+		// result carries a job id, so programmatic callers (codemode reads
+		// `structuredContent` verbatim) get an honest object instead of pi's
+		// `{exit_code: 0, full_output_path: <pi temp file>}`.
+		outputSchema: Type.Object({
+			...(inner.outputSchema as TObject).properties,
+			exit_code: Type.Optional(Type.Number({ description: "Absent when job_id is set: the command is still running" })),
+			job_id: Type.Optional(
+				Type.String({ description: "Background handle for pbb list/status/tail/kill and the completion follow-up" }),
+			),
+		}),
+		async execute(
+			toolCallId,
+			params: { command: string; timeout?: number; background?: boolean },
+			signal,
+			onUpdate,
+			ctx,
+		): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
+			const cwd = ctx?.cwd ?? process.cwd();
+			const autoAfterSeconds = getAutoBackgroundAfterSeconds(cwd);
+			const immediate = params.background === true;
 
-			if (signal?.aborted) {
-				throw new Error("Command aborted");
+			if (signal?.aborted) throw new Error("Command aborted");
+			if (session.activeJobs.size >= MAX_ACTIVE_JOBS) {
+				throw new Error(
+					`Too many bash jobs running (${session.activeJobs.size}/${MAX_ACTIVE_JOBS}). Wait for one to finish before starting another.`,
+				);
 			}
 
-			if (params.background) {
-				if (session.activeJobs.size >= MAX_ACTIVE_JOBS) {
-					throw new Error(`Too many bash jobs running (${session.activeJobs.size}/${MAX_ACTIVE_JOBS}). Wait for one to finish before starting another.`);
-				}
+			// Every call gets a job id up front: it names the log file, which is
+			// written from the moment the command is spawned (Decision 2: the full
+			// output always exists as a file). A call that finishes in the foreground
+			// leaves no job record behind, so `pbb list` only ever shows jobs.
+			const pbb = pbbIdentity(ctx, session.id);
+			const job: ActiveJob = {
+				id: "",
+				session,
+				command: params.command,
+				toolCallId,
+				startedAt: Date.now(),
+				cwd,
+				pbb,
+				repairContext: ctx,
+				timeoutSeconds: params.timeout,
+			};
+			job.id = allocateJobId(session, pbb);
+			job.logPath = logPathFor(job);
+			session.activeJobs.set(job.id, job);
 
-				const job: ActiveJob = {
-					id: "",
-					session,
-					command: params.command,
-					toolCallId,
-					abortController: new AbortController(),
-					startedAt: Date.now(),
-					cwd: ctx.cwd,
-					pbb: pbbIdentity(ctx, session.id),
-					runner: "pbb",
-					repairContext: ctx,
-				};
-				job.id = allocateJobId(session, job.pbb);
-				session.activeJobs.set(job.id, job);
-				recordPbbJobStarted(job, ctx.cwd);
+			// Promotion ran: the tool call has its answer, so the job record can no
+			// longer race a completion that arrives later.
+			const onPromote = (elapsedMs: number) => {
+				recordPbbJobStarted(job, cwd, {
+					promotedAt: new Date().toISOString(),
+					promotedAfterSeconds: Math.round(elapsedMs / 100) / 10,
+					promotionThresholdSeconds: immediate ? 0 : autoAfterSeconds,
+				});
 				session.pending.start({
 					id: job.id,
 					text: job.command,
 					startedAt: job.startedAt,
 					details: { toolCallId: job.toolCallId },
 				});
-
-				const completedPromise = runPbbBash(job, ctx.cwd, params);
-				// Capture cwd eagerly: the completion callback may fire after session
-				// teardown (headless one-shot exit), when ctx.cwd access throws.
-				const jobCwd = ctx.cwd;
-				void completedPromise.then((completed) => {
-					finishBackgroundJob(session, job, completed, jobCwd);
-				});
 				scheduleDetachedBackgroundToolResultRepair(ctx, toolCallId);
+			};
 
-				return {
-					content: [{ type: "text", text: `Bash job ${job.id} started in background. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
-					details: runningJobDetails(job, ctx.cwd),
-				};
-			}
+			// Exit detection for a promoted job. `signalCode` means one of our kills
+			// (`pbb kill`, timeout, session shutdown) — never a fabricated exit.
+			const onExit = (exit: PromotedExit) => {
+				if (exit.error !== undefined) {
+					job.errorMessage = exit.error instanceof Error ? exit.error.message : String(exit.error);
+					finishBackgroundJob(session, job, { outcome: "error", exitCode: null }, cwd);
+					return;
+				}
+				const outcome = exit.timedOut ? "timeout" : exit.signalCode || job.abortRequested ? "abort" : "exit";
+				finishBackgroundJob(session, job, { outcome, exitCode: exit.code }, cwd);
+			};
 
-			if (autoAfterSeconds <= 0) {
-				const job: ActiveJob = {
-					id: `fg_${toolCallId}`,
-					session,
-					command: params.command,
-					toolCallId,
-					abortController: new AbortController(),
-					startedAt: Date.now(),
-					runner: "pbb",
-				};
-				session.activeJobs.set(job.id, job);
-				const forwardAbort = () => job.abortController.abort();
-				if (signal?.aborted) forwardAbort();
-				else signal?.addEventListener("abort", forwardAbort, { once: true });
-				try {
-					const completed = await runPbbBash(job, ctx.cwd, params, onUpdate);
-					if (completed.status === "success") return truncateForegroundResult(job, completed);
-					rethrowBashError(completed, job);
-				} finally {
-					signal?.removeEventListener("abort", forwardAbort);
-					session.activeJobs.delete(job.id);
+			const bashExec = createBashExec({
+				logPath: job.logPath,
+				spawnEnv: (base) => pbbSpawnEnv(pbb, base),
+				promoteImmediately: immediate,
+				onSpawn(child) {
+					job.child = child;
+					job.pid = child.pid ?? undefined;
+					job.pgid = child.pid ?? undefined;
+				},
+				onPromote,
+				onExit,
+			});
+
+			const delegate = createBashToolDefinition(cwd, { operations: { exec: bashExec.exec } });
+			const resultPromise = delegate.execute(
+				toolCallId,
+				{ command: params.command, ...(params.timeout === undefined ? {} : { timeout: params.timeout }) },
+				signal,
+				onUpdate as AgentToolUpdateCallback<BashToolDetails | undefined> | undefined,
+				ctx,
+			);
+			// Settle-shaped, so a promotion win can never leave an unhandled rejection.
+			const settledResult = resultPromise.then(
+				(result) => ({ result }) as const,
+				(error: unknown) => ({ error }) as const,
+			);
+
+			let finished: Awaited<typeof settledResult>;
+			if (immediate || autoAfterSeconds <= 0) {
+				finished = await settledResult;
+			} else {
+				const raced = await Promise.race([
+					settledResult,
+					waitForBackgroundThreshold(autoAfterSeconds).then(() => "promote" as const),
+				]);
+				if (raced === "promote") {
+					// The threshold won: promote (a command that just ended finishes
+					// normally instead) and take whatever pi's call returns.
+					bashExec.promote();
+					finished = await settledResult;
+				} else {
+					finished = raced;
 				}
 			}
 
-			if (session.activeJobs.size >= MAX_ACTIVE_JOBS) {
-				throw new Error(`Too many bash jobs running (${session.activeJobs.size}/${MAX_ACTIVE_JOBS}). Wait for one to finish before starting another.`);
+			if (bashExec.promoted) {
+				// The job is ours now; its completion arrives on `onExit`.
+				return promotedToolResult(job, "result" in finished ? finished.result : undefined, immediate ? undefined : autoAfterSeconds);
 			}
 
-			const job: ActiveJob = {
-				// Foreground bash calls should not consume visible bg001 IDs unless they
-				// actually cross the threshold and become background jobs.
-				id: `auto_${toolCallId}`,
-				session,
-				command: params.command,
-				toolCallId,
-				abortController: new AbortController(),
-				startedAt: Date.now(),
-				repairContext: ctx,
-			};
-			session.activeJobs.set(job.id, job);
-
-			let backgrounded = false;
-			const forwardAbort = () => {
-				if (!backgrounded) job.abortController.abort();
-			};
-			if (signal?.aborted) forwardAbort();
-			else signal?.addEventListener("abort", forwardAbort, { once: true });
-
-			let latestBody = "";
-			const completedPromise = runPbbBash(job, ctx.cwd, params, (update) => {
-				latestBody = getText(update);
-				if (!backgrounded) onUpdate?.(update);
-			});
-
-			const winner = await Promise.race([completedPromise, waitForBackgroundThreshold(autoAfterSeconds)]);
-			if (winner !== "background") {
-				signal?.removeEventListener("abort", forwardAbort);
-				session.activeJobs.delete(job.id);
-				if (winner.status === "success") return truncateForegroundResult(job, winner);
-				rethrowBashError(winner, job);
-			}
-
-			backgrounded = true;
-			signal?.removeEventListener("abort", forwardAbort);
 			session.activeJobs.delete(job.id);
-			job.cwd = ctx.cwd;
-			job.pbb = pbbIdentity(ctx, session.id);
-			job.id = allocateJobId(session, job.pbb);
-			session.activeJobs.set(job.id, job);
-			recordPbbJobStarted(job, ctx.cwd);
-			appendPbbLogDelta(job, latestBody);
-			session.pending.start({
-				id: job.id,
-				text: job.command,
-				startedAt: job.startedAt,
-				details: { toolCallId: job.toolCallId },
-			});
-
-			// Capture cwd eagerly: the completion callback may fire after session
-			// teardown (headless one-shot exit), when ctx.cwd access throws.
-			const jobCwd = ctx.cwd;
-			void completedPromise.then((completed) => {
-				finishBackgroundJob(session, job, completed, jobCwd);
-			});
-			scheduleDetachedBackgroundToolResultRepair(ctx, toolCallId);
-
-			return {
-				content: [{ type: "text", text: `Bash job ${job.id} moved to background after ${formatThreshold(autoAfterSeconds)}. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
-				details: runningJobDetails(job, ctx.cwd),
-			};
+			if ("error" in finished) {
+				// Foreground failure: nothing can read the log any more, and pi's
+				// message already carries the output plus the status.
+				discardJobLog(job);
+				throw finished.error;
+			}
+			return foregroundToolResult(job, finished.result) as AgentToolResult<BashToolDetails | BackgroundBashDetails>;
 		},
 	});
 }
