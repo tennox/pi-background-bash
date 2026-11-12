@@ -11,6 +11,7 @@ import { Box, Container, Text } from "@earendil-works/pi-tui";
 import { createPiPending, type PiPendingRegistry } from "pi-pending";
 import { type TObject, Type } from "typebox";
 import { type ChildExit, exitCodeFrom, JOB_EXIT_STDIO_GRACE_MS, waitForChildExit } from "../lib/child-exit.ts";
+import { capBodyToPiWindow, formatLogFile, loadOutputFormatConfig } from "../lib/output-format.ts";
 import { formatTruncationNotice, piContext, truncateContextText } from "./pi-context-utils.ts";
 
 const MAX_ACTIVE_JOBS = 10;
@@ -195,13 +196,6 @@ function normalizeSignal(value: unknown): NodeJS.Signals {
 
 function formatDuration(ms: number): string {
 	return `${(ms / 1000).toFixed(1)}s`;
-}
-
-function formatBytes(bytes: number): string {
-	if (!Number.isFinite(bytes) || bytes < 0) return "an unknown size";
-	if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`;
-	if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-	return `${bytes} bytes`;
 }
 
 function readConfigFile(path: string): BackgroundBashConfig {
@@ -766,15 +760,11 @@ export function readLogTail(path: unknown, maxBytes = LOG_TAIL_MAX_BYTES): strin
 	}
 }
 
-/** The log stopped at `maxLogBytes`: say so instead of letting a tail look complete. */
-function logCapNotice(job: ActiveJob): string {
-	if (!job.logTruncated) return "";
-	return `Log capped at ${formatBytes(job.logBytes ?? 0)}: output written after that point was not recorded.`;
-}
-
-/** The completion body: the command's own output tail plus how it ended. */
-function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
-	const output = readLogTail(job.logPath);
+/**
+ * How the job ended, as notice lines for the completion body (empty when the
+ * command simply exited 0).
+ */
+function completionNotices(job: ActiveJob, result: JobResult): string[] {
 	const suffix =
 		result.outcome === "timeout"
 			? `Command timed out after ${job.timeoutSeconds} seconds`
@@ -785,8 +775,38 @@ function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
 					: result.exitCode === null || result.exitCode === 0
 						? ""
 						: `Command exited with code ${result.exitCode}`;
-	const notices = [suffix, logCapNotice(job)].filter((line) => line.length > 0).join("\n");
-	return notices ? completionBody(output, notices) : output;
+	return suffix ? [suffix] : [];
+}
+
+/**
+ * The completion body: the command's own output plus how it ended. Formatting
+ * lives in `lib/output-format.ts` (PLAN §7) — this only hands it the log file and
+ * the notices:
+ *
+ *  - a log that hit `maxLogBytes` is reshaped from its first and last bytes and
+ *    says that its tail is not the true end of the output (PLAN §7b);
+ *  - any other log is capped exactly like a pi tool result — the tail window
+ *    pi uses, with `pbb tail <job>` as the route to everything (decision 6: no
+ *    truncation numbers of our own, and no head+tail where pi would not truncate).
+ */
+function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
+	const { headLines, tailLines, maxLines, maxBytes } = loadOutputFormatConfig(job.cwd);
+	const notices = completionNotices(job, result);
+	if (job.logTruncated) {
+		return formatLogFile(job.logPath, {
+			headLines,
+			tailLines,
+			maxLines,
+			maxBytes,
+			fullOutputPath: `pbb tail ${job.id} --full`,
+			logTruncated: true,
+			logBytes: job.logBytes ?? 0,
+			notices,
+		});
+	}
+	const output = readLogTail(job.logPath);
+	const body = notices.length > 0 ? completionBody(output, notices.join("\n")) : output;
+	return capBodyToPiWindow(body, { maxLines, maxBytes, fullOutputPath: `pbb tail ${job.id} --full` });
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1087,6 +1107,11 @@ function trimOversizedToolResultsForContext(messages: AgentMessage[]): AgentMess
 	const next = messages.map((message) => {
 		const record = asRecord(message);
 		if (record?.role !== "toolResult") return message;
+		// A result pi itself truncated is not an oversized historical result: it is
+		// already pi's window, and `extensions/output-format.ts` reshapes it into
+		// head+tail. Trimming it here would eat the head and stack a second notice.
+		const details = asRecord(record.details);
+		if (details?.fullOutputPath || details?.truncation) return message;
 		const content = Array.isArray(record.content) ? record.content : [];
 		let contentChanged = false;
 		const nextContent = content.map((part) => {
@@ -1104,14 +1129,6 @@ function trimOversizedToolResultsForContext(messages: AgentMessage[]): AgentMess
 		return { ...message, content: nextContent } as AgentMessage;
 	});
 	return changed ? next : undefined;
-}
-
-/**
- * A completion body: the log tail, capped exactly like pi caps a tool result,
- * with the job id as the route to the whole file.
- */
-function truncateBackgroundBody(job: ActiveJob, body: string): string {
-	return truncateBodyWithHint(body, `pbb tail ${job.id} --full`);
 }
 
 /** Where a call's full output lives. Job calls: the instance log dir. */
@@ -1264,7 +1281,7 @@ function finishBackgroundJob(session: SessionState, job: ActiveJob, result: JobR
 	// The completion body comes from the log file, not from a buffered copy: the
 	// log is the canonical output and is still the only thing that survives a
 	// `/reload` (PLAN §6).
-	const body = truncateBackgroundBody(job, completionBodyFromLog(job, result));
+	const body = completionBodyFromLog(job, result);
 	const content = buildXmlResult(job, result.outcome, result.exitCode, durationMs, body);
 	const details: BackgroundBashDetails = {
 		jobId: job.id,

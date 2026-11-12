@@ -44,6 +44,48 @@ only copy of output the agent has not seen yet).
 A job file must never stay at `status: "running"` after its command ended. `delivered: false` with a
 `droppedReason` is the honest record of a notification that could not be delivered in-process.
 
+## Output formatting
+
+The extension ships two entry points: the runner in `extensions/background-bash.ts` and the
+model-facing output layer in `extensions/output-format.ts` (helpers in
+`lib/output-format.ts`). The output layer is a presentation-only filter — it never changes what a
+command does, what the log holds, or what the TUI shows.
+
+**What the model reads.** Every `bash` tool result and every completion body:
+
+- ANSI/CSI/OSC sequences and control characters are stripped (`\n` and `\t` stay), and each line
+  keeps only its last `\r` frame, so a progress bar reads as its final state instead of 2000 frames;
+- a result pi itself truncated (`details.truncation` / `details.fullOutputPath`) is reshaped to the
+  **first 3 lines + `… N lines / <size> omitted …` + the last 10 lines + `Full output: <path>`**, with the
+  counts taken from pi's own truncation numbers. Results pi did not truncate pass through
+  byte-for-byte: this layer has no size budget of its own and can never make a result tighter than
+  builtin bash;
+- an oversized *historical* result that carries no full-output path is trimmed by the context guard
+  (pi's 2000-line/50 KB window, tail kept), as before;
+- each body is computed **once** and frozen for the session, keyed by its `toolCallId` — re-deriving
+  from a log that is still growing would move text under an already-sent prompt prefix.
+
+A completion body is capped like a pi tool result and names `pbb tail <job> --full`. A job whose log
+hit `maxLogBytes` is instead reshaped from the log's first and last bytes and says explicitly that
+its tail is not the true end of the output.
+
+**What the log holds.** The log stays raw: exactly the command's bytes, nothing added. Neither the
+cap nor any formatting marker is ever written into it, so `pbb tail`, `rg`, and every other reader
+see unfiltered output. `logTruncated`/`logBytes` live in the job file only.
+
+**What is deliberately not affected.** The layer rewrites the model-facing message list only, so:
+
+- the TUI keeps rendering the stored transcript entries (pi's bash renderer) — human text ≠ model text;
+- codemode reads `structuredContent`, which the tool produced;
+- compaction summarises the raw message text, not the formatted body.
+
+Each surface is fixed where it is produced; “one owner formats everything” is not claimed.
+
+Counts are configurable in `~/.pi/bash-output.json` (project override: `.pi/bash-output.json`):
+`headLines` (3), `tailLines` (10), `maxLines` (2000) and `maxBytes` (51200). The first two are
+presentation counts pending sign-off; the last two are pi's own truncation window, not numbers of
+this layer's own.
+
 ## Reconcile sweep
 
 At `session_start` the extension scans its own `sessionKey`'s job files (never another session's —

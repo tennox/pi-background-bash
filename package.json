@@ -30,7 +30,8 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./index.ts",
+      "./extensions/output-format.ts"
     ],
     "skills": [
       "./skills"
@@ -62,6 +63,8 @@
   "files": [
     "index.ts",
     "extensions/background-bash.ts",
+    "extensions/output-format.ts",
+    "lib",
     "bin/pbb.js",
     "docs",
     "skills",

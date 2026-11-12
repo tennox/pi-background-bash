@@ -134,6 +134,29 @@ Background job state is stored under:
 
 `pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. If the owner is stale, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly.
 
+## Output formatting
+
+The `bash` tool result the model reads is not the TUI's text, and it is not the log. Three
+surfaces, three owners:
+
+- **the model** reads a presentation pass over every bash result and completion: ANSI/control
+  sequences stripped, `\r` progress frames collapsed to their last frame. If pi truncated the result,
+  it is reshaped to the **first 3 lines + `… N lines / <size> omitted …` + the last 10 lines + `Full
+  output: <path>`** (counts from pi's own `details.truncation`); a result pi did not truncate is
+  passed through byte-for-byte, because this layer keeps no truncation budget of its own. Each body
+  is frozen per `toolCallId`, so a still-growing log can never move text the model already saw.
+- **the log** (`logs/<jobId>.log`) holds the command's raw bytes — nothing added, no cap marker, no
+  formatting. `pbb tail <job> --full` and `rg` read exactly that.
+- **the TUI** renders the stored transcript entries, and **codemode** reads `structuredContent`:
+  neither is affected by the output layer (`extensions/output-format.ts`), which only rewrites the
+  model-facing message list. Compaction likewise summarises the raw text.
+
+A job log that hit `maxLogBytes` is reshaped from the file's first and last bytes and says plainly
+that its tail is not the true end; only the first and last `maxBytes` of a log are ever read.
+
+Counts are configured in `~/.pi/bash-output.json` (project override: `.pi/bash-output.json`):
+`headLines` (3), `tailLines` (10), `maxLines` (2000), `maxBytes` (51200).
+
 ## Configuration
 
 Default auto-background threshold: `30` seconds.
@@ -160,6 +183,16 @@ You can also override the threshold for a single project with `.pi/background-ba
 | --- | --- | --- |
 | `autoBackgroundAfterSeconds` | `30` | move a still-running call to the background; `0` disables automatic backgrounding (`background: true` still works) |
 | `maxLogBytes` | `104857600` (100 MB) | size cap per job log. Appending stops at the cap; the job file records `logTruncated: true` + `logBytes`, and the completion message, `pbb status` and `pbb tail` say the log is capped. Nothing is written into the log itself. |
+
+Output formatting has its own config file, `~/.pi/bash-output.json`, with a per-project override in
+`.pi/bash-output.json`:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `headLines` | `3` | lines shown from the start of a result pi truncated (and of a capped job log) |
+| `tailLines` | `10` | lines shown from the end of such a result |
+| `maxLines` | `2000` | pi's own truncation window — a completion body is capped like a tool result, with no extra budget of this layer's own |
+| `maxBytes` | `51200` | byte budget of the same window, and how much of a log is read from each end |
 
 Job logs older than 7 days are deleted at `session_start`, except for jobs that are still
 running or whose completion was never delivered. Both keys can be set globally and per
