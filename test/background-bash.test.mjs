@@ -694,6 +694,118 @@ test("pbb shows pi-lane owner liveness and stale status", () => {
   }
 });
 
+// Decision 3 (todo/2026-11-11_bash-extension-choice/COMPARISON.md): the default view
+// is THIS session + THIS instance. Widening is explicit, and the output says which
+// scope was applied so a narrow view cannot be mistaken for "nothing running".
+test("pbb scopes jobs to this session + this instance and widens only on request", () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-scopes-${process.pid}-${Date.now()}-`));
+  const pbbRoot = join(dir, "pbb");
+  const now = new Date().toISOString();
+  const writeJob = (sessionKey, instanceId, jobId, command) => {
+    const jobs = join(pbbRoot, "sessions", sessionKey, "instances", instanceId, "jobs");
+    mkdirSync(jobs, { recursive: true });
+    writeFileSync(join(jobs, `${jobId}.json`), JSON.stringify({ jobId, globalJobId: `${instanceId}:${jobId}`, status: "running", command, startedAt: now, instanceId }));
+  };
+  writeJob("scopes-key", "scopes-current", "bg001", "mine-only");
+  writeJob("scopes-key", "scopes-sibling", "bg002", "sibling-instance");
+  writeJob("other-scopes-key", "scopes-foreign", "bg003", "other-session");
+
+  const env = { ...process.env, PBB_ROOT: pbbRoot, PI_LANE_SESSION_KEY: "scopes-key", PI_LANE_SESSION_ID: "scopes-session", PI_LANE_INSTANCE_ID: "scopes-current", PI_LANE_CURRENT_LANE: "main" };
+  const run = (...args) => execFileSync(process.execPath, [PBB_CLI, ...args], { env, encoding: "utf8" });
+
+  try {
+    const current = run("list");
+    assert.match(current, /mine-only/);
+    assert.doesNotMatch(current, /sibling-instance/);
+    assert.doesNotMatch(current, /other-session/);
+    // the narrow view announces itself and how to widen it
+    assert.match(current, /scope=current-instance/);
+    assert.match(current, /--scope session/);
+    assert.match(current, /--all/);
+
+    const session = run("list", "--scope", "session");
+    assert.match(session, /mine-only/);
+    assert.match(session, /sibling-instance/);
+    assert.doesNotMatch(session, /other-session/);
+    assert.match(session, /scope=session/);
+
+    for (const widening of [["list", "--all"], ["list", "--scope", "all"]]) {
+      const all = run(...widening);
+      assert.match(all, /mine-only/);
+      assert.match(all, /sibling-instance/);
+      assert.match(all, /other-session/);
+      assert.match(all, /scope=all/);
+      assert.doesNotMatch(all, /Widen with/);
+    }
+
+    // an out-of-scope job says "widen", not "no such job"
+    assert.throws(() => execFileSync(process.execPath, [PBB_CLI, "status", "bg003"], { env, encoding: "utf8", stdio: "pipe" }), /Command failed/);
+    let outOfScope = "";
+    try {
+      run("status", "bg003");
+    } catch (error) {
+      outOfScope = String(error.stderr ?? "");
+    }
+    assert.match(outOfScope, /unknown job bg003/);
+    assert.match(outOfScope, /--all/);
+    assert.match(run("status", "bg003", "--scope", "all"), /other-session/);
+
+    // an unknown scope value is rejected instead of silently narrowing
+    assert.throws(() => execFileSync(process.execPath, [PBB_CLI, "list", "--scope", "everywhere"], { env, encoding: "utf8", stdio: "pipe" }), /Command failed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Regression: a live owner used to be rendered `owner=stale status=unknown` whenever
+// pi-lane had no instance record for it (the normal case on installs without pi-lane,
+// where the instance id is the `pbb_<pid>_<hash>` fallback). Liveness now also reads
+// the instance's own identity.json pid, and "cannot tell" is reported as unknown.
+test("pbb reports a live job owner as live without a pi-lane record", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-liveness-${process.pid}-${Date.now()}-`));
+  const pbbRoot = join(dir, "pbb");
+  const key = "liveness-key";
+  // a real child process stands in for the owning pi runtime; it stays alive for the
+  // "live" assertion and is killed for the "dead" one
+  const child = spawn("sleep", ["30"], { stdio: "ignore" });
+  const deadChild = spawn("sleep", ["30"], { stdio: "ignore" });
+  const instanceDir = (instanceId) => join(pbbRoot, "sessions", key, "instances", instanceId);
+  const liveInstance = `pbb_${child.pid}_0000aaaa`;
+  const deadInstance = `pbb_${deadChild.pid}_0000bbbb`;
+
+  try {
+    for (const [instanceId, pid, jobId, command] of [[liveInstance, child.pid, "bg001", "live-owner-job"], [deadInstance, deadChild.pid, "bg002", "dead-owner-job"]]) {
+      mkdirSync(join(instanceDir(instanceId), "jobs"), { recursive: true });
+      writeFileSync(join(instanceDir(instanceId), "identity.json"), JSON.stringify({ instanceId, pid, sessionKey: key, updatedAt: new Date().toISOString() }));
+      writeFileSync(join(instanceDir(instanceId), "jobs", `${jobId}.json`), JSON.stringify({ jobId, globalJobId: `${instanceId}:${jobId}`, status: "running", command, startedAt: new Date().toISOString(), instanceId, pid: 1, pgid: 1 }));
+    }
+    const deadExit = new Promise((resolve) => deadChild.once("exit", resolve));
+    deadChild.kill("SIGKILL");
+    await deadExit;
+
+    const env = { ...process.env, PBB_ROOT: pbbRoot, PI_LANE_SESSION_KEY: key, PI_LANE_SESSION_ID: "liveness-session", PI_LANE_INSTANCE_ID: liveInstance, PI_LANE_CURRENT_LANE: "main" };
+    const run = (...args) => execFileSync(process.execPath, [PBB_CLI, ...args], { env, encoding: "utf8" });
+
+    const list = run("list", "--scope", "session");
+    const lineFor = (text) => list.split("\n").find((line) => line.includes(text)) ?? "";
+    assert.match(lineFor("live-owner-job"), /owner=live/);
+    assert.doesNotMatch(lineFor("live-owner-job"), /owner=stale|owner=unknown/);
+    assert.match(lineFor("dead-owner-job"), /owner=dead \(pid \d+ is gone\)/);
+
+    const kill = run("kill", "bg001", "--scope", "session");
+    assert.doesNotMatch(kill, /may not be honored/);
+    assert.doesNotMatch(kill, /liveness unknown/);
+
+    const deadKill = run("kill", "bg002", "--scope", "session");
+    assert.match(deadKill, /is dead \(pid \d+ is gone\), so the cooperative kill will not be honored/);
+    assert.match(deadKill, /--stale/);
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+    try { deadChild.kill("SIGKILL"); } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pbb status and pbb tail say the log is capped instead of promising the full output", () => {
   const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-logcap-${process.pid}-${Date.now()}-`));
   const pbbRoot = join(dir, "pbb");

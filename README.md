@@ -107,12 +107,26 @@ This package also installs `pbb`, a small inspector for background bash jobs.
 ```bash
 pbb self
 pbb list
+pbb list --scope session   # widen: every instance of this session
+pbb list --all             # widen: every session under the root
 pbb status bg001
 pbb tail bg001 -n 80
 pbb kill bg001
 ```
 
 `pbb` is designed for agents: output is wrapped in compact `pi_context` envelopes and always includes session/instance identity. Local job IDs are fixed-width strings such as `bg001`, `bg002`, and `bg010` so listings sort chronologically. `pbb` uses [`pi-lane`](https://github.com/sshkeda/pi-lane) runtime identity env vars (`PI_LANE_SESSION_KEY`, `PI_LANE_INSTANCE_ID`, etc.) and defaults to the current live Pi instance, not every terminal attached to the same session.
+
+### Scope: this session + this instance by default
+
+**Migration note: `pbb list` defaults to *this session + this instance*.** Jobs started by
+sibling instances, subagent sessions and other sessions are hidden — widen with
+`--scope session` (every instance of this session) or `--all` (every session under the root,
+for forensics; `--scope all` is the same thing). Every list starts with the scope it applied and
+a `Widen with …` line, so a short list cannot be mistaken for “nothing is running”. The same
+flags apply to `pbb status`/`pbb tail`/`pbb kill` job lookup, and `--instance <id>` targets one
+named instance of this session. The reasoning is recorded in
+[`todo/2026-11-11_bash-extension-choice/COMPARISON.md`](todo/2026-11-11_bash-extension-choice/COMPARISON.md)
+decision 3; the flag/field details are in [`docs/pbb-runner.md`](docs/pbb-runner.md#scope-session--instance).
 
 `pbb` does not need to be on your login-shell PATH. Every command the extension spawns gets
 `~/.pi/pbb/bin` prepended to `PATH`, where the extension maintains a small `pbb` shim pointing at
@@ -130,9 +144,9 @@ Background job state is stored under:
   logs/{jobId}.log
 ```
 
-`pbb list` and `pbb status` show owner liveness through the tracked `pil` CLI from `pi-lane`, so stale/disconnected owners are visible instead of silently confused with the current runtime. If tracked `pi-lane`/`pil` is missing or fails, `pbb` hard-fails instead of silently degrading liveness to unknown.
+`pbb list` and `pbb status` show owner liveness as `owner=live|stale|dead|unknown`. pi-lane's per-session instance records (via the tracked `pil` CLI) are the first source; when pi-lane has no record for the instance — the normal case without pi-lane installed, where the instance id is pbb's `pbb_<pid>_<hash>` fallback — pbb probes the pid recorded in the instance's `identity.json`, so a live owner is reported live (`owner=dead (pid N is gone)` only when that process is really gone). `owner=unknown` means no liveness source exists; it is never reported as `stale`. A hard-failing `pi-lane`/`pil` binary still hard-fails instead of silently degrading liveness to unknown.
 
-`pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. If the owner is stale, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly.
+`pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. The “may not be honored” warning only appears for a non-live owner; for `stale`/`dead`/`unknown` owners, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly.
 
 ## Output formatting
 

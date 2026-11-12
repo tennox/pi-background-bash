@@ -8,11 +8,55 @@ PBB is the baseline bash runner for pi-background-bash v1.
 - Background jobs are owned by PBB from process start, and owned *per session*: one pi process serves several sessions (`/new`, `/resume`, subagents) and each owns only its own jobs.
 - Job IDs use fixed-width local IDs: `bg001`, `bg002`, ..., `bg999`, then `bg1000`. IDs are unique per instance directory; the allocator is process-wide so two sessions sharing an instance directory cannot collide.
 - Jobs record `pid` and `pgid` for process-group control.
-- `pbb list`, `pbb status`, and `pbb tail` inspect the recorded job state/logs.
+- `pbb list`, `pbb status` and `pbb tail` inspect the recorded job state/logs.
 - `pbb kill` requests live owner shutdown through the instance mailbox.
 - `pbb kill --stale --instance <id> <job>` explicitly signals a stale recorded process group.
 - Verbose completion messages are truncated in-session and point to `pbb tail <job> --full` for complete output.
 - `pbb` is put on `PATH` for spawned commands (`<root>/bin/pbb` shim); per-spawn `PBB_*`/`PI_LANE_SESSION_*` identity is never written into `process.env`.
+
+## Scope (session + instance)
+
+Binding decision: `todo/2026-11-11_bash-extension-choice/COMPARISON.md` decision 3 — *session
+scoping is the default everywhere*. Subagent and sibling sessions' jobs must not appear unless
+the caller widens the view explicitly.
+
+| command | default scope | wider |
+| --- | --- | --- |
+| `pbb list` | this session + this instance | `--scope session` = every instance of this session; `--all` (== `--scope all`) = every session under the root |
+| `pbb status JOB` / `pbb tail JOB` / `pbb kill JOB` | job lookup resolves in this session + this instance | same flags |
+| `--instance ID` | one named instance of this session (scope label `instance`) | — |
+| `pbb instances` | every instance of this session (pi-lane records) | `--all` / `--scope all` |
+| `pbb self` | identity only, no scoping | — |
+
+Every rendered list starts with the scope that was applied —
+`scope=current-instance — this session (<key>) + this instance (<id>)` — and, when not already
+widest, a `Widen with …` line naming the flags and how many instances/sessions they would add.
+That line exists because a narrow view must never be misread as "nothing is running". A job id
+that falls outside the current scope fails as `unknown job <id>` **with the same widen hint**,
+and an unrecognised `--scope` value is a usage error (exit 2) instead of a silent narrowing.
+
+In `--json` output the existing field `scope` keeps its values `current-instance` and `session`
+and gains `all`; jobs listed under `all` gain a `sessionKey` field (job records already carry
+it), and `--instance` selects the new scope value `instance` plus an `instance` field in the
+`pbb.list` payload. Everything else in the payload shape is unchanged.
+
+## Owner liveness
+
+`pbb` reports the owning runtime as `owner=live|stale|dead|unknown`:
+
+1. **pi-lane record** (when pi-lane is installed and has seen that instance): `live`/`stale`
+   per its heartbeat and status — unchanged from before.
+2. **instance pid** (no pi-lane record — the normal case on installs without pi-lane, where the
+   instance id is pbb's `pbb_<pid>_<hash>` fallback): the pid from the instance's own
+   `identity.json` (or from that id) is probed with `kill(pid, 0)`. The process exists →
+   `owner=live`; it is gone → `owner=dead (pid N is gone)`. On Linux the process start time is
+   compared with `identity.json`'s `updatedAt` so a recycled pid is reported as dead, not live.
+3. **no source**: `owner=unknown`, with the reason — pbb lacking a liveness source is not
+   evidence that the owner is gone, so it never claims `stale`.
+
+Only a non-live owner is warned about: a `live` owner means the cooperative kill will be picked
+up; `dead`/`unknown`/`stale` say the mailbox request is queued but unconfirmed and point at
+`pbb kill <job> --instance <id> --stale` for an explicit process-group signal.
 
 ## Job file lifecycle
 

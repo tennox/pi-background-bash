@@ -82,14 +82,6 @@ function instanceDir(id, instanceId = id.instanceId) {
   return join(sessionDir(id), "instances", instanceId);
 }
 
-function jobsDir(id, instanceId = id.instanceId) {
-  return join(instanceDir(id, instanceId), "jobs");
-}
-
-function logsDir(id, instanceId = id.instanceId) {
-  return join(instanceDir(id, instanceId), "logs");
-}
-
 function requestsDir(id, instanceId = id.instanceId) {
   return join(instanceDir(id, instanceId), "requests");
 }
@@ -129,9 +121,16 @@ function pilCommand(id) {
   return { file: process.execPath, args: [TRACKED_PIL_BIN] };
 }
 
-function readPilInstances(id) {
-  if (pilInstancesCache !== undefined) return pilInstancesCache;
+/**
+ * pi-lane's per-session instance records. Cached per session key, because
+ * `--scope all` asks for the liveness of instances in sessions other than this one.
+ */
+function readPilInstances(id, sessionKey = id.sessionKey) {
+  if (pilInstancesCache === undefined) pilInstancesCache = new Map();
+  const cached = pilInstancesCache.get(sessionKey);
+  if (cached !== undefined) return cached;
   const pil = pilCommand(id);
+  let instances;
   try {
     const raw = execFileSync(pil.file, [...pil.args, "instances", "--json"], {
       encoding: "utf8",
@@ -139,56 +138,212 @@ function readPilInstances(id) {
       env: {
         ...process.env,
         PI_LANE_ROOT: id.laneRoot || process.env.PI_LANE_ROOT || "",
-        PI_LANE_SESSION_KEY: id.sessionKey,
+        PI_LANE_SESSION_KEY: sessionKey,
         PI_LANE_SESSION_ID: id.sessionId,
         PI_LANE_SESSION_FILE: id.sessionFile,
         PI_LANE_INSTANCE_ID: id.instanceId,
         PI_LANE_CURRENT_LANE: id.lane,
       },
     });
-    pilInstancesCache = JSON.parse(raw).instances || [];
+    instances = JSON.parse(raw).instances || [];
   } catch (error) {
     failPil(id, "tracked pi-lane pil command failed", error);
   }
-  return pilInstancesCache;
+  pilInstancesCache.set(sessionKey, instances);
+  return instances;
 }
 
-function ownerInfo(id, job) {
-  const state = readPilInstances(id).find((item) => item.instanceId === job.instanceId);
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the pid exists but belongs to another user — still alive.
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * When a pid was reused by an unrelated process, `kill(pid, 0)` would report a
+ * dead owner as live. /proc/<pid>/stat's start time settles it (Linux only).
+ */
+function processStartMs(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const startTicks = Number(fields[19]);
+    const uptimeSeconds = Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]);
+    if (!Number.isFinite(startTicks) || !Number.isFinite(uptimeSeconds)) return undefined;
+    return Date.now() - (uptimeSeconds - startTicks / 100) * 1000;
+  } catch {
+    return undefined;
+  }
+}
+
+function ownerPidOf(job, record) {
+  const recorded = Number(record?.pid);
+  if (Number.isInteger(recorded) && recorded > 0) return recorded;
+  // Older/foreign instance dirs carry no identity.json: the fallback instance id
+  // itself is `pbb_<pid>_<hash>` and still names the owning pi process.
+  const match = /^pbb_(\d+)_/.exec(String(job.instanceId ?? ""));
+  return match ? Number(match[1]) : undefined;
+}
+
+/**
+ * Owner liveness from two sources, in order:
+ *
+ *  1. pi-lane's instance record (heartbeat/status) — authoritative when pi-lane is
+ *     installed; `stale` keeps its pi-lane meaning (record exists, heartbeat old).
+ *  2. the instance's own `identity.json` pid, written by the extension whenever it
+ *     records a job event. `kill(pid, 0)` answers "is that pi process still there".
+ *     This is the common case on installs without pi-lane, where the instance id is
+ *     the `pbb_<pid>_<hash>` fallback and there is no lane record to read.
+ *
+ * When neither source can answer, the owner is `unknown` — never `stale`: pbb not
+ * being able to see liveness is not evidence that the owner is gone.
+ */
+function ownerInfo(id, job, sessionKey = id.sessionKey) {
+  const lane = readPilInstances(id, sessionKey).find((item) => item.instanceId === job.instanceId);
+  const seen = { ownerLastSeenAt: lane?.lastSeenAt || "", ownerLastSeenAgeMs: lane?.lastSeenAgeMs };
+  if (lane) {
+    return {
+      ...seen,
+      ownerStatus: lane.status || "unknown",
+      ownerLiveness: lane.live ? "live" : "stale",
+      ownerLive: Boolean(lane.live),
+      ownerStale: !lane.live,
+      ownerSource: "pi-lane",
+    };
+  }
+  const record = job.instanceId ? readJson(join(id.root, "sessions", sessionKey, "instances", job.instanceId, "identity.json")) : undefined;
+  const pid = ownerPidOf(job, record);
+  if (!pid) {
+    return {
+      ...seen,
+      ownerStatus: "unknown",
+      ownerLiveness: "unknown",
+      ownerLive: false,
+      ownerStale: true,
+      ownerSource: "none",
+      ownerNote: "no pi-lane instance record and no recorded owner pid",
+    };
+  }
+  let alive = processAlive(pid);
+  let note = alive ? undefined : `pid ${pid} is gone`;
+  if (alive && record?.updatedAt) {
+    const started = processStartMs(pid);
+    const recordedAt = Date.parse(record.updatedAt);
+    if (Number.isFinite(started) && Number.isFinite(recordedAt) && started > recordedAt + 2000) {
+      alive = false;
+      note = `pid ${pid} was reused by a newer process`;
+    }
+  }
   return {
-    ownerStatus: state?.status || "unknown",
-    ownerLastSeenAt: state?.lastSeenAt || "",
-    ownerLastSeenAgeMs: state?.lastSeenAgeMs,
-    ownerLive: Boolean(state?.live),
-    ownerStale: !state?.live,
+    ...seen,
+    ownerStatus: alive ? "alive" : "gone",
+    ownerLiveness: alive ? "live" : "dead",
+    ownerLive: alive,
+    ownerStale: !alive,
+    ownerSource: "instance-pid",
+    ownerPid: pid,
+    ...(note ? { ownerNote: note } : {}),
   };
 }
 
-function enrichJob(id, job, path) {
-  return { ...job, ...ownerInfo(id, job), _path: path };
+const SCOPE_CURRENT = "current-instance";
+const SCOPE_INSTANCE = "instance";
+const SCOPE_SESSION = "session";
+const SCOPE_ALL = "all";
+
+function usageError(message) {
+  console.error(context("pbb.error", { scope: "none", error: "usage" }, message));
+  process.exit(2);
 }
 
-function listInstanceIds(id, scope, explicitInstance) {
-  if (explicitInstance) return [explicitInstance];
-  if (scope === "current-instance") return [id.instanceId];
-  const dir = join(sessionDir(id), "instances");
+function normalizeScope(raw) {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (value === "") return undefined;
+  if (["current-instance", "current", "default", "this"].includes(value)) return SCOPE_CURRENT;
+  if (["session", "this-session"].includes(value)) return SCOPE_SESSION;
+  if (["all", "root"].includes(value)) return SCOPE_ALL;
+  return null;
+}
+
+/**
+ * Decision 3: the default view is THIS session + THIS instance. Widening is always
+ * explicit — `--scope session` for every instance of this session, `--all` (or
+ * `--scope all`) for every session under the root, for forensics.
+ */
+function resolveScope(opts) {
+  if (opts.instance && opts.all) usageError("--instance cannot be combined with --all");
+  const requested = normalizeScope(opts.scope);
+  if (requested === null) usageError(`unknown scope: ${opts.scope} (use --scope current-instance|session|all, or --all)`);
+  if (requested && opts.all && requested !== SCOPE_ALL) usageError(`--all conflicts with --scope ${opts.scope}`);
+  if (opts.instance) return { scope: SCOPE_INSTANCE, instance: opts.instance };
+  return { scope: requested === SCOPE_ALL || opts.all ? SCOPE_ALL : (requested ?? SCOPE_CURRENT) };
+}
+
+function readSessionKeys(id) {
+  const dir = join(id.root, "sessions");
   if (!existsSync(dir)) return [];
   return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
 }
 
-function readJobs(id, { scope = "current-instance", instance } = {}) {
+function readInstanceIds(id, sessionKey) {
+  const dir = join(id.root, "sessions", sessionKey, "instances");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+}
+
+function instanceTargets(id, scope, explicitInstance) {
+  if (explicitInstance) return [{ sessionKey: id.sessionKey, instanceId: explicitInstance }];
+  if (scope === SCOPE_CURRENT) return [{ sessionKey: id.sessionKey, instanceId: id.instanceId }];
+  const sessionKeys = scope === SCOPE_ALL ? readSessionKeys(id) : [id.sessionKey];
+  const targets = [];
+  for (const sessionKey of sessionKeys) {
+    for (const instanceId of readInstanceIds(id, sessionKey)) targets.push({ sessionKey, instanceId });
+  }
+  return targets;
+}
+
+function readJobs(id, { scope = SCOPE_CURRENT, instance } = {}) {
   const jobs = [];
-  for (const iid of listInstanceIds(id, scope, instance)) {
-    const dir = jobsDir(id, iid);
+  for (const target of instanceTargets(id, scope, instance)) {
+    const dir = join(id.root, "sessions", target.sessionKey, "instances", target.instanceId, "jobs");
     if (!existsSync(dir)) continue;
     for (const item of readdirSync(dir)) {
       if (!item.endsWith(".json")) continue;
       const path = join(dir, item);
       const job = readJson(path);
-      if (job) jobs.push(enrichJob(id, job, path));
+      if (!job) continue;
+      jobs.push({ ...job, sessionKey: job.sessionKey ?? target.sessionKey, ...ownerInfo(id, job, target.sessionKey), _path: path });
     }
   }
   return jobs.sort((a, b) => String(a.startedAt ?? "").localeCompare(String(b.startedAt ?? "")) || String(a.jobId).localeCompare(String(b.jobId)));
+}
+
+/** Human-readable line naming the scope that was actually applied. */
+function describeScope(id, scope, instance) {
+  if (scope === SCOPE_CURRENT) return `scope=current-instance — this session (${id.sessionKey}) + this instance (${id.instanceId})`;
+  if (scope === SCOPE_INSTANCE) return `scope=instance — this session (${id.sessionKey}), instance ${instance} (picked with --instance)`;
+  if (scope === SCOPE_SESSION) return `scope=session — all ${readInstanceIds(id, id.sessionKey).length} instance(s) of this session (${id.sessionKey})`;
+  return `scope=all — every session under ${id.root} (${readSessionKeys(id).length} session(s))`;
+}
+
+/** How to see more than the current view — the narrow default must never read as "nothing running". */
+function widenHint(id, scope) {
+  if (scope === SCOPE_ALL) return "";
+  const parts = [];
+  if (scope === SCOPE_CURRENT || scope === SCOPE_INSTANCE) {
+    parts.push(`--scope session (${readInstanceIds(id, id.sessionKey).length} instance(s) in this session)`);
+  }
+  parts.push(`--all (${readSessionKeys(id).length} session(s) under ${id.root})`);
+  const hidden =
+    scope === SCOPE_SESSION
+      ? "jobs from other sessions are hidden from this view."
+      : "jobs from sibling instances, sibling/subagent sessions and other sessions are hidden from this view.";
+  return `Widen with ${parts.join(" or ")}: ${hidden}`;
 }
 
 function findJob(id, jobId, opts) {
@@ -204,6 +359,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--json") out.json = true;
     else if (arg === "--full") out.full = true;
+    else if (arg === "--all") out.all = true;
     else if (arg === "--scope") out.scope = argv[++i];
     else if (arg === "--instance") out.instance = argv[++i];
     else if (arg === "--since" || arg === "--cursor") out.since = argv[++i];
@@ -265,46 +421,87 @@ function liveLogBytes(job) {
 function formatJob(job) {
   const age = job.startedAt ? `${Math.max(0, Math.round((Date.now() - Date.parse(job.startedAt)) / 1000))}s` : "?";
   const exit = job.exitCode === undefined || job.exitCode === null ? "" : ` exit=${job.exitCode}`;
-  const owner = job.ownerLive ? "owner=live" : `owner=stale status=${job.ownerStatus || "unknown"}`;
+  const owner = job.ownerLive
+    ? "owner=live"
+    : `owner=${job.ownerLiveness || "stale"}${job.ownerLiveness === "stale" ? ` status=${job.ownerStatus || "unknown"}` : ` (${job.ownerNote || job.ownerSource || "unknown"})`}`;
   const pgid = job.pgid ? ` pgid=${job.pgid}` : "";
-  return `- job=${job.jobId} global=${job.globalJobId} status=${job.status}${exit} age=${age} instance=${job.instanceId} ${owner}${pgid} cmd=${JSON.stringify(job.command ?? "")}`;
+  const instance = job.instanceId === undefined ? "" : ` instance=${job.instanceId}`;
+  return `- job=${job.jobId} global=${job.globalJobId} status=${job.status}${exit} age=${age}${instance} ${owner}${pgid} cmd=${JSON.stringify(job.command ?? "")}`;
 }
 
+/**
+ * `pbb instances` lists instances, so its natural floor is this session (a listing
+ * restricted to the current instance would be pointless); `--all` widens it to every
+ * session under the root, and the output always says which of the two it is.
+ */
 function printInstances(id, opts) {
-  const scope = opts.scope || "session";
-  const pilInstances = readPilInstances(id);
-  const instances = pilInstances.map((item) => ({ instanceId: item.instanceId, ownerLive: Boolean(item.live), ownerStatus: item.status || "unknown", ownerLastSeenAt: item.lastSeenAt || "", lane: item.lane || "" }));
-  if (opts.json) return console.log(json({ kind: "pbb.instances", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, source: "pil", instances }));
-  console.log(context("pbb.instances", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, source: "pil", instances: instances.length }, instances.map((item) => `- instance=${item.instanceId} live=${item.ownerLive} status=${item.ownerStatus} lane=${item.lane || ""} last_seen=${item.ownerLastSeenAt || "unknown"}`).join("\n") || "No instances in scope."));
+  const requested = normalizeScope(opts.scope);
+  if (requested === null) usageError(`unknown scope: ${opts.scope} (use --scope session|all, or --all)`);
+  if (opts.all && requested && requested !== SCOPE_ALL) usageError(`--all conflicts with --scope ${opts.scope}`);
+  if (opts.instance) usageError("pbb instances takes --scope/--all, not --instance");
+  const scope = opts.all || requested === SCOPE_ALL ? SCOPE_ALL : SCOPE_SESSION;
+  const instances = [];
+  for (const sessionKey of scope === SCOPE_ALL ? readSessionKeys(id) : [id.sessionKey]) {
+    for (const record of readPilInstances(id, sessionKey)) {
+      instances.push({
+        sessionKey,
+        instanceId: record.instanceId,
+        ownerLive: Boolean(record.live),
+        ownerLiveness: record.live ? "live" : "stale",
+        ownerStatus: record.status || "unknown",
+        ownerLastSeenAt: record.lastSeenAt || "",
+        lane: record.lane || "",
+      });
+    }
+  }
+  const payload = { kind: "pbb.instances", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, source: "pil", instances };
+  if (opts.json) return console.log(json(payload));
+  const line = scope === SCOPE_ALL ? `scope=all — pi-lane instances of every session under ${id.root} (${new Set(instances.map((item) => item.sessionKey)).size} session(s) with instances)` : `scope=session — pi-lane instances of this session (${id.sessionKey})`;
+  const body = instances.map((item) => `- instance=${item.instanceId} live=${item.ownerLive} status=${item.ownerStatus} lane=${item.lane || ""} last_seen=${item.ownerLastSeenAt || "unknown"}${scope === SCOPE_ALL ? ` session=${item.sessionKey}` : ""}`).join("\n");
+  console.log(context("pbb.instances", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, source: "pil", instances: instances.length }, `${line}\n${body || "No instances in scope."}`));
 }
 
-function printList(id, opts) {
-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
-  const jobs = readJobs(id, { scope, instance: opts.instance });
-  const payload = { kind: "pbb.list", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, jobs };
-  if (opts.json) return console.log(json(payload));
-  const counts = jobs.reduce((acc, job) => { acc[job.status] = (acc[job.status] || 0) + 1; return acc; }, {});
-  console.log(context("pbb.list", {
+function scopeAttrs(id, scope, instance) {
+  return {
     session_id: id.sessionId,
     session_key: id.sessionKey,
     instance_id: id.instanceId,
     lane: id.lane,
     scope,
+    ...(scope === SCOPE_INSTANCE && instance ? { instance } : {}),
+  };
+}
+
+function printList(id, opts) {
+  const { scope, instance } = resolveScope(opts);
+  const jobs = readJobs(id, { scope, instance });
+  const payload = { kind: "pbb.list", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, ...(scope === SCOPE_INSTANCE ? { instance } : {}), jobs };
+  if (opts.json) return console.log(json(payload));
+  const counts = jobs.reduce((acc, job) => { acc[job.status] = (acc[job.status] || 0) + 1; return acc; }, {});
+  const hint = widenHint(id, scope);
+  console.log(context("pbb.list", {
+    ...scopeAttrs(id, scope, instance),
     jobs: jobs.length,
     ...Object.fromEntries(Object.entries(counts).map(([status, count]) => [`jobs_${status}`, count])),
-  }, jobs.map(formatJob).join("\n") || "No background bash jobs in scope."));
+  }, [describeScope(id, scope, instance), jobs.map(formatJob).join("\n") || "No background bash jobs in scope.", hint].filter(Boolean).join("\n")));
+}
+
+/** A job id that is not in the current (narrow) scope must say so, not read as "no such job". */
+function unknownJobMessage(id, jobId, scope, instance) {
+  const hint = widenHint(id, scope);
+  return `unknown job ${jobId}\n${describeScope(id, scope, instance)}${hint ? `\n${hint}` : ""}`;
 }
 
 function printStatus(id, jobId, opts) {
   if (!jobId) return printList(id, opts);
-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
-  const result = findJob(id, jobId, { scope, instance: opts.instance });
+  const { scope, instance } = resolveScope(opts);
+  const result = findJob(id, jobId, { scope, instance });
   if (result.error === "missing") {
-    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "unknown_job" }, `unknown job ${jobId}`));
+    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "unknown_job" }, unknownJobMessage(id, jobId, scope, instance)));
     process.exit(2);
   }
   if (result.error === "ambiguous") {
-    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "ambiguous_job", matches: result.jobs.length }, `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}`));
+    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "ambiguous_job", matches: result.jobs.length }, `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}\nPick one with: pbb status ${jobId} --instance <instanceId>`));
     process.exit(3);
   }
   const found = result.job;
@@ -328,14 +525,14 @@ function tailText(path, lines, full) {
 }
 
 function printTail(id, jobId, opts) {
-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
-  const result = findJob(id, jobId, { scope, instance: opts.instance });
+  const { scope, instance } = resolveScope(opts);
+  const result = findJob(id, jobId, { scope, instance });
   if (!result.job) {
-    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, `${result.error === "ambiguous" ? "ambiguous" : "unknown"} job ${jobId}`));
+    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, result.error === "ambiguous" ? `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}\nPick one with: pbb tail ${jobId} --instance <instanceId>` : unknownJobMessage(id, jobId, scope, instance)));
     process.exit(result.error === "ambiguous" ? 3 : 2);
   }
   const job = result.job;
-  const logPath = job.logPath || join(logsDir(id, job.instanceId), `${job.jobId}.log`);
+  const logPath = job.logPath || join(id.root, "sessions", job.sessionKey ?? id.sessionKey, "instances", job.instanceId, "logs", `${job.jobId}.log`);
   const body = tailText(logPath, opts.lines, opts.full);
   if (opts.json) return console.log(json({ kind: "pbb.tail", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, job, log: body }));
   const cap = formatLogCap(job);
@@ -364,10 +561,10 @@ function signalProcessGroup(pgid, signal) {
 }
 
 function printKill(id, jobId, opts) {
-  const scope = opts.scope || (opts.instance ? "session" : "current-instance");
-  const result = findJob(id, jobId, { scope, instance: opts.instance });
+  const { scope, instance } = resolveScope(opts);
+  const result = findJob(id, jobId, { scope, instance });
   if (!result.job) {
-    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, `${result.error === "ambiguous" ? "ambiguous" : "unknown"} job ${jobId}`));
+    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, result.error === "ambiguous" ? `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}\nPick one with: pbb kill ${jobId} --instance <instanceId>` : unknownJobMessage(id, jobId, scope, instance)));
     process.exit(result.error === "ambiguous" ? 3 : 2);
   }
   const job = result.job;
@@ -399,8 +596,15 @@ function printKill(id, jobId, opts) {
     requestedAt: new Date().toISOString(),
   };
   writeJsonFile(join(requestsDir(id, job.instanceId), `${requestId}.json`), request);
-  const warning = job.ownerStale ? `\nOwner instance appears stale. Cooperative kill is queued but may not be honored. If this is a PBB-runner job with pgid, use: pbb kill ${job.jobId} --instance ${job.instanceId} --stale` : "";
-  console.log(context("pbb.kill", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, request_id: requestId, status: job.status, owner_live: job.ownerLive, requested: true }, `kill requested for ${job.jobId}\nThe owning pi-background-bash runtime will abort the job if it is still live.${warning}`));
+  const staleKillHint = job.pgid ? ` If this is a PBB-runner job with pgid, use: pbb kill ${job.jobId} --instance ${job.instanceId} --stale` : "";
+  const warning = job.ownerLive
+    ? ""
+    : job.ownerLiveness === "dead"
+      ? `\nOwner instance ${job.instanceId} is dead (${job.ownerNote || "pid gone"}), so the cooperative kill will not be honored.${staleKillHint}`
+      : job.ownerLiveness === "unknown"
+        ? `\nOwner liveness unknown (${job.ownerNote || "no liveness record"}): the cooperative kill is queued, nothing is confirmed.${staleKillHint}`
+        : `\nOwner instance appears stale. Cooperative kill is queued but may not be honored.${staleKillHint}`;
+  console.log(context("pbb.kill", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, request_id: requestId, status: job.status, owner_live: job.ownerLive, owner_liveness: job.ownerLiveness, requested: true }, `kill requested for ${job.jobId}\n${describeScope(id, scope, instance)}\nThe owning pi-background-bash runtime will abort the job if it is still live.${warning}`));
 }
 
 const opts = parseArgs(process.argv.slice(2));
@@ -408,7 +612,7 @@ const command = opts._[0] || "list";
 const id = identity();
 
 if (["help", "--help", "-h"].includes(command)) {
-  console.log(`pbb - Pi background bash inspector\n\nCommands:\n  pbb self [--json]\n  pbb list [--scope current-instance|session] [--instance ID] [--json]\n  pbb instances [--json]\n  pbb status [JOB] [--json]\n  pbb tail JOB [-n LINES] [--full] [--json]\n  pbb kill JOB [--stale] [--signal TERM]\n\nDefaults to the current pi-lane instance using PI_LANE_* env vars.`);
+  console.log(`pbb - Pi background bash inspector\n\nCommands:\n  pbb self [--json]\n  pbb list [--scope current-instance|session|all] [--all] [--instance ID] [--json]\n  pbb instances [--scope session|all] [--all] [--json]\n  pbb status [JOB] [--scope ...] [--json]\n  pbb tail JOB [-n LINES] [--full] [--json]\n  pbb kill JOB [--stale] [--signal TERM]\n\nScope: the default view is THIS session + THIS instance. --scope session widens to every\ninstance of this session; --all (same as --scope all) widens to every session under the root.\nJobs from sibling instances, subagent sessions and other sessions are hidden by default.\nScope comes from PI_LANE_* env vars (pi-lane); pbb self shows the resolved identity.`);
   process.exit(0);
 }
 

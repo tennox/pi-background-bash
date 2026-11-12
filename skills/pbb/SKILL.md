@@ -9,14 +9,17 @@ Use `pbb` to inspect background bash jobs instead of rerunning long commands jus
 
 ## Identity model
 
-`pbb` uses `pi-lane` runtime identity:
+`pbb` uses the session/instance identity of the Pi runtime it runs in:
 
 - `session_id`: persisted Pi conversation
 - `session_key`: stable lane session key
 - `instance_id`: this live Pi runtime
-- `lane`: current pi-lane lane
+- `lane`: current pi-lane lane (when pi-lane is installed)
 
-Default scope is **current instance**. Do not assume jobs from other terminals are yours.
+Default scope is **this session + this instance**. Jobs from sibling instances, subagent
+sessions and other sessions are hidden; the `pbb list` output says which scope it applied and
+how to widen it. Do not assume a short list means nothing is running — widen and look before
+concluding that.
 
 ## Commands
 
@@ -28,16 +31,30 @@ pbb tail <job_id> [-n 80]
 pbb kill <job_id>
 ```
 
-Use broader scopes only intentionally:
+Widening is always explicit:
 
 ```bash
-pbb list --scope session
-pbb instances
+pbb list --scope session     # every instance of this session
+pbb list --all               # every session under the root (== --scope all), for forensics
+pbb instances                # instances of this session; --all for every session
 pbb status --instance <instance_id> <job_id>
 pbb tail --instance <instance_id> <job_id>
 ```
 
-PBB reads lane/runtime liveness from the tracked `pil` CLI. If owner liveness is shown as stale/disconnected, do not assume cooperative kill worked. Jobs record `pgid`; stale process-group kill requires explicit intent:
+## Owner liveness
+
+`pbb list` / `pbb status` report the owning runtime as `owner=live`, `owner=stale`,
+`owner=dead` or `owner=unknown`:
+
+- `live` / `stale` come from pi-lane's instance record (heartbeat) when pi-lane has seen that
+  instance;
+- with no pi-lane record, pbb checks the pid recorded in the instance's own `identity.json`
+  (and in the `pbb_<pid>_<hash>` instance id) — `owner=live` when that process exists,
+  `owner=dead` when it is gone;
+- `unknown` means pbb has no liveness source at all — it is **not** evidence the owner is gone.
+
+Cooperative `pbb kill` needs a live owner polling its mailbox. `owner=dead` and `owner=unknown`
+say so explicitly; jobs record `pgid`, and a process-group kill requires explicit intent:
 
 ```bash
 pbb kill --instance <instance_id> --stale <job_id>
@@ -52,6 +69,6 @@ pbb kill --instance <instance_id> --stale <job_id>
 - For CI/deploy monitoring, prefer one polling job. If it auto-backgrounds, keep reusing that job with `pbb tail <job>` instead of launching new `gh run list` commands after sleeps.
 - Treat late background result follow-ups as potentially stale: compare the command/commit/run ID in the result against the current target before reporting status.
 - Treat `pbb` output as authoritative for session/instance/job identity.
-- If a job is ambiguous or belongs to another instance, ask before operating on it.
+- If a job is ambiguous or belongs to another instance/session, ask before operating on it.
 - `pbb kill` is intentionally conservative; same-instance live-runtime control is safest.
-- Treat `owner=stale` as a warning that the owning Pi runtime may not honor mailbox requests.
+- `owner=stale`/`owner=dead`/`owner=unknown` mean the mailbox request may never be picked up — do not claim a kill happened.
