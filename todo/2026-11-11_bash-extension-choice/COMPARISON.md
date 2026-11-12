@@ -245,3 +245,28 @@ of the nix-config TUI patches**.
   per-session correctness, job records, CLI, 30 s timer, digest, context guard.
 
 Recommendation unchanged in direction, now with less risk attached: **B′**.
+
+---
+
+# Decisions (manu, 2026-11-11) — these override the sketches above
+
+1. **Own the process, like a normal bash call.** No wrapper process, no nonce marker in
+   the log, no completion poller, no separate watcher. Spawn the command the way pi's bash
+   does, keep the `ChildProcess` handle, and simply don't block the turn on it: the
+   extension resolves the tool result early on promotion and awaits `exit` in the
+   background. (pi-bg-bash needs its wrapper/marker/poller only because it holds no
+   handle.) Consequence accepted: after a pi crash no exact exit code exists — the boot
+   reconcile marks those jobs `lost` (honest, log readable) rather than inventing a code.
+2. **Full output always available as a file.** Output goes to the job log file from t0
+   (stdout/stderr FD), so every result — foreground and background — can name a real
+   path. When a result is truncated, `details.fullOutputPath` and the truncation notice
+   both carry that path, so the agent can `rg`/`tail` it directly.
+3. **Session scoping is the default everywhere.** Subagent and sibling sessions' jobs
+   must not appear: not in the TUI (pending widget, footer, any picker) and not in
+   `pbb list` unless explicitly widened (`--scope`/`--all`). Default scope = this session,
+   this instance.
+4. **ANSI stripping is not the background extension's job.** It is a general `bash` tool
+   question (pi core), to be raised there; the extension keeps logs and results raw.
+5. **Truncation shows head *and* tail** (e.g. first 3 + last 10 lines) with an explicit
+   "N lines omitted" marker plus the full-output path, and the tool description says so —
+   so the model knows it does not need to sleep/poll/tail on its own.
