@@ -227,25 +227,6 @@ function splitLines(text: string): string[] {
 /** pi appends its own truncation notice to the text it returns; take it back off. */
 const PI_NOTICE_PATTERN = /^\[Showing [^\n]*\]$/;
 
-function splitTrailingNotice(text: string): { body: string; notice?: string } {
-	const lines = text.split("\n");
-	const notices: string[] = [];
-	for (;;) {
-		let index = lines.length - 1;
-		while (index >= 0 && lines[index].trim() === "") index--;
-		if (index < 0) break;
-		const candidate = lines[index].trim();
-		if (!PI_NOTICE_PATTERN.test(candidate)) break;
-		// Another hook (or pi itself) may have appended more than one notice: drop
-		// all of them, keep the outermost for the `lastLinePartial` case.
-		notices.push(candidate);
-		lines.length = index;
-	}
-	while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
-	const body = lines.join("\n");
-	return notices.length === 0 ? { body } : { body, notice: notices[0] };
-}
-
 /** pi's `details.truncation` (`tools/bash.ts:343`), as far as we read it. */
 export interface TruncationFacts {
 	truncated?: boolean;
@@ -273,13 +254,126 @@ function wasTruncated(truncation: TruncationFacts | undefined): boolean {
 	return truncation.truncated === true || truncation.truncatedBy === "lines" || truncation.truncatedBy === "bytes";
 }
 
+/** Text pi would itself have truncated (its tail window). */
+function exceedsPiWindow(text: string): boolean {
+	if (Buffer.byteLength(text, "utf8") > DEFAULT_OUTPUT_FORMAT.maxBytes) return true;
+	return splitLines(text).length > DEFAULT_OUTPUT_FORMAT.maxLines;
+}
+
+const SIZE_UNITS: Record<string, number> = { B: 1, KB: 1024, MB: 1024 * 1024, GB: 1024 * 1024 * 1024 };
+
+function parseSize(value: string): number | undefined {
+	const match = /^([\d.]+)\s*([KMG]?B)$/.exec(value.trim());
+	if (!match) return undefined;
+	const size = Number(match[1]) * (SIZE_UNITS[match[2]] ?? 1);
+	return Number.isFinite(size) ? Math.round(size) : undefined;
+}
+
+export interface PiNoticeFacts {
+	/** The numbers pi wrote in its notice. */
+	truncation: TruncationFacts;
+	/** `. Full output: <path>` — pi's own route to the file, when the notice has one. */
+	fullOutputPath?: string;
+}
+
+/**
+ * Read pi's own truncation notice (`tools/bash.ts`, `formatOutput`) back.
+ *
+ * This matters for a **failed** command: pi throws on timeout/abort, the agent
+ * loop wraps the throw in a result with `details: {}`, and the truncation facts
+ * are gone — but pi's notice line is still in the text, and it is the only
+ * record that a fuller file exists. Re-reading it lets the reshape name pi's
+ * real path instead of inventing one.
+ */
+export function parsePiTruncationNotice(line: string): PiNoticeFacts | undefined {
+	const text = line.trim();
+	if (!PI_NOTICE_PATTERN.test(text)) return undefined;
+	const path = /\.\s*Full output:\s*(.+)\]$/.exec(text);
+	const facts: TruncationFacts = { truncated: true, truncatedBy: "lines" };
+	const partial = /^\[Showing last [^ ]+ of line (\d+)/.exec(text);
+	if (partial) {
+		facts.truncatedBy = "bytes";
+		facts.lastLinePartial = true;
+		facts.totalLines = Number(partial[1]);
+	} else {
+		const lines = /^\[Showing lines (\d+)-(\d+) of (\d+)/.exec(text);
+		if (!lines) return undefined;
+		facts.totalLines = Number(lines[3]);
+		facts.outputLines = Math.max(0, Number(lines[2]) - Number(lines[1]) + 1);
+		const limit = /\(([\d.]+\s*[KMG]?B) limit\)/.exec(text);
+		if (limit) {
+			facts.truncatedBy = "bytes";
+			const maxBytes = parseSize(limit[1]);
+			if (maxBytes !== undefined) facts.maxBytes = maxBytes;
+		}
+	}
+	return { truncation: facts, ...(path ? { fullOutputPath: path[1].trim() } : {}) };
+}
+
+interface SplitNotices {
+	/** The body with pi's notice line(s) taken out. */
+	body: string;
+	/** pi's own notice line, when one was found (outermost first). */
+	notice?: string;
+	/** Non-notice lines that sat after the notice, e.g. pi's exit/timeout status. */
+	trailing: string[];
+}
+
+/**
+ * Split a body into its text, pi's notice, and whatever pi appended after that
+ * notice. Two shapes occur: the notice is the last line (a successful run), or
+ * pi appended a status after it (`Command exited with code 3`, a timeout text) —
+ * left in place, that notice would read as a second footer in the middle of the
+ * reshaped body.
+ */
+function splitNotices(text: string, tailLines: number): SplitNotices {
+	const lines = text.split("\n");
+	const trimEnd = () => {
+		while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+	};
+	trimEnd();
+	let notice: string | undefined;
+	for (;;) {
+		if (lines.length === 0) break;
+		const candidate = lines[lines.length - 1].trim();
+		if (!parsePiTruncationNotice(candidate)) break;
+		notice ??= candidate;
+		lines.pop();
+		trimEnd();
+	}
+	// Only the near-the-end window is inspected, so command output that merely
+	// looks like a notice further up is left alone.
+	const from = Math.max(0, lines.length - (Math.max(0, tailLines) + 3));
+	let index = -1;
+	for (let i = lines.length - 1; i >= from; i--) {
+		if (parsePiTruncationNotice(lines[i].trim())) {
+			index = i;
+			break;
+		}
+	}
+	const trailing: string[] = [];
+	if (index >= 0) {
+		notice ??= lines[index].trim();
+		for (const line of lines.slice(index + 1)) {
+			const trimmed = line.trim();
+			if (trimmed !== "") trailing.push(trimmed);
+		}
+		lines.length = index;
+		trimEnd();
+	}
+	return { body: lines.join("\n"), ...(notice === undefined ? {} : { notice }), trailing };
+}
+
 /**
  * The model-facing body for one bash result.
  *
- * Always: strip escapes, collapse `\r`. Then — only when pi already truncated
- * the result, i.e. it carries `details.truncation`/`details.fullOutputPath` —
- * reshape to `headLines` + omitted marker + `tailLines` + the full-output path.
- * An already-shaped body (one carrying our marker) is returned unchanged.
+ * Always: strip escapes, collapse `\r`. Then reshape to `headLines` + omitted
+ * marker + `tailLines` + the full-output path — only for a result pi already
+ * truncated, i.e. one carrying `details.truncation`/`details.fullOutputPath`, or
+ * one whose text is larger than pi's window *and* carries pi's own notice (pi's
+ * error path drops the details but keeps the notice). Everything else passes
+ * through with presentation only. An already-shaped body (one carrying our
+ * marker) is returned unchanged.
  *
  * The omitted counts come from pi's own numbers (`totalLines`/`totalBytes`),
  * never from the text handed in: the head we can show is the head of pi's
@@ -292,11 +386,26 @@ export function formatForModel(options: FormatForModelOptions): string {
 	if (text === "") return "";
 	if (hasOmittedMarker(text)) return text;
 	const presented = presentText(text);
-	if (!wasTruncated(options.truncation)) return presented;
 
 	const headLines = Math.max(0, options.headLines ?? DEFAULT_OUTPUT_FORMAT.headLines);
 	const tailLines = Math.max(0, options.tailLines ?? DEFAULT_OUTPUT_FORMAT.tailLines);
-	const { body, notice } = splitTrailingNotice(presented);
+
+	let working = presented;
+	let truncation = options.truncation;
+	let fullOutputPath = options.fullOutputPath;
+	let extractedTrailing: string[] = [];
+	if (!wasTruncated(truncation)) {
+		if (!exceedsPiWindow(presented)) return presented;
+		const split = splitNotices(presented, tailLines);
+		const facts = split.notice === undefined ? undefined : parsePiTruncationNotice(split.notice);
+		if (!facts) return presented;
+		truncation = facts.truncation;
+		fullOutputPath = fullOutputPath ?? facts.fullOutputPath;
+		working = split.body;
+		extractedTrailing = split.trailing;
+	}
+
+	const { body, notice, trailing } = splitNotices(working, tailLines);
 	const lines = splitLines(body);
 	if (lines.length <= headLines + tailLines) {
 		// pi's window is already tiny: nothing to omit, keep it whole.
@@ -305,7 +414,6 @@ export function formatForModel(options: FormatForModelOptions): string {
 
 	const head = headLines > 0 ? lines.slice(0, headLines).join("\n") : "";
 	const tail = tailLines > 0 ? lines.slice(lines.length - tailLines).join("\n") : "";
-	const truncation = options.truncation;
 	const totalLines = truncation?.totalLines !== undefined && truncation.totalLines >= lines.length ? truncation.totalLines : lines.length;
 	const omittedLines = Math.max(0, totalLines - (headLines + tailLines));
 	const keptBytes = Buffer.byteLength(head, "utf8") + Buffer.byteLength(tail, "utf8");
@@ -317,12 +425,12 @@ export function formatForModel(options: FormatForModelOptions): string {
 
 	// A partial last line has no line number to report: keep pi's own wording.
 	const footer = truncation?.lastLinePartial
-		? notice
+		? (notice ?? tailFooter(totalLines, tailLines, { fullOutputPath }))
 		: tailFooter(totalLines, tailLines, {
-				fullOutputPath: options.fullOutputPath,
+				fullOutputPath,
 				byteLimit: truncation?.truncatedBy === "bytes" ? (truncation.maxBytes ?? DEFAULT_OUTPUT_FORMAT.maxBytes) : undefined,
 			});
-	return assemble({ head, tail, omittedLines, omittedBytes, footer });
+	return assemble({ head, tail, omittedLines, omittedBytes, footer, notices: [...trailing, ...extractedTrailing] });
 }
 
 /* ------------------------------------------------------------------------- *

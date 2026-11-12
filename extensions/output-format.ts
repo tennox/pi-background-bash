@@ -9,9 +9,12 @@
  *  - a result pi already truncated (`details.truncation`/`details.fullOutputPath`)
  *    is reshaped to head + `… N lines / X omitted …` + tail + the full-output
  *    path, so the model reads the beginning *and* the end instead of pi's tail
- *    window alone;
+ *    window alone. A *failed* command is truncated by pi too but comes back
+ *    without `details`, so the reshape also recognises pi's own notice line and
+ *    reuses the real path it names;
  *  - a historical result that carries no full-output path is trimmed by the
- *    size guard (the fallback carried over from the background-bash extension);
+ *    size guard, which says that no full-output file exists instead of naming a
+ *    fake one;
  *  - each body is computed once and frozen for the rest of the session, keyed
  *    by the message's own identity (`toolCallId`, or custom-type + timestamp).
  *    Re-deriving on every request would let a still-growing log move the text
@@ -26,10 +29,10 @@
  * Each surface is fixed where it is produced; claiming "one owner formats
  * everything" would be false.
  *
- * Note: `extensions/background-bash.ts` still registers its own trim-only
- * `context` hook for the same size guard, because that hook's test lives outside
- * this change. Formatting and trimming here are idempotent, so the duplicate is
- * harmless; the old call site is one deletion away from a single owner.
+ * Note: this is the single owner of model-facing truncation and reshape (PLAN
+ * §7). `extensions/background-bash.ts` no longer registers a trim-only `context`
+ * hook of its own; it only produces the completion bodies, through the same
+ * `lib/output-format.ts` helpers.
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -45,7 +48,12 @@ import { formatTruncationNotice, truncateContextText } from "./pi-context-utils.
 /** Bounded so a long session with thousands of results cannot grow the map forever. */
 const MAX_CACHED_BODIES = 2000;
 
-const GUARD_HINT = "result trimmed by pi-background-bash context guard";
+/**
+ * Marks a body this hook already trimmed: a historical result that is oversized
+ * and has no full-output file anywhere. Deliberately says nothing about a path —
+ * there is no path, and a fabricated one used to read as a second footer.
+ */
+const TRIMMED_NOTICE = "this result was trimmed to keep the request small; no full-output file exists";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
@@ -106,9 +114,14 @@ function escapeClosingTags(text: string): string {
 	return text.replace(/<\/pi_context>/gi, "<\\/pi_context>");
 }
 
-/** The size guard, carried over unchanged from the background-bash extension. */
-function trimOversized(text: string, toolName: string, config: OutputFormatConfig): string {
-	if (text.includes(GUARD_HINT)) return text;
+/**
+ * The size guard for a *historical* result that carries no full-output path and
+ * for any non-bash tool result pi left oversized. It never invents a path: the
+ * body says that no full-output file exists instead of pointing at a string that
+ * reads like one (PLAN §7 — the reshape/notice wording is pi's).
+ */
+function trimOversized(text: string, config: OutputFormatConfig): string {
+	if (text.includes(TRIMMED_NOTICE)) return text;
 	const { content, truncation } = truncateContextText(text, {
 		mode: "tail",
 		maxLines: config.maxLines,
@@ -117,8 +130,7 @@ function trimOversized(text: string, toolName: string, config: OutputFormatConfi
 	});
 	if (!truncation?.truncated) return text;
 	const notice = formatTruncationNotice(truncation, "tail");
-	const hint = `${toolName} ${GUARD_HINT}`;
-	const withHint = notice.endsWith("]") ? `${notice.slice(0, -1)}. Full output: ${hint}]` : `${notice} Full output: ${hint}`;
+	const withHint = notice.endsWith("]") ? `${notice.slice(0, -1)} — ${TRIMMED_NOTICE}]` : `${notice} ${TRIMMED_NOTICE}`;
 	return `${escapeClosingTags(content)}\n\n${withHint}`;
 }
 
@@ -156,7 +168,7 @@ function transformFor(record: Record<string, unknown>, state: HookState): TextTr
 			// A result pi did not truncate has no full-output path: the size guard
 			// is the fallback for historical results, exactly as before.
 			if (fullOutputPath || truncation) return formatted;
-			return trimOversized(formatted, "bash", state.config);
+			return trimOversized(formatted, state.config);
 		};
 	}
 
@@ -165,8 +177,7 @@ function transformFor(record: Record<string, unknown>, state: HookState): TextTr
 	}
 
 	if (role === "toolResult") {
-		const toolName = typeof record.toolName === "string" ? record.toolName : "tool";
-		return (text) => trimOversized(text, toolName, state.config);
+		return (text) => trimOversized(text, state.config);
 	}
 
 	return undefined;

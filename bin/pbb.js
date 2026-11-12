@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -247,6 +247,21 @@ function formatLogCap(job) {
   return `log capped${size}; output after the cap was not recorded`;
 }
 
+/**
+ * The log's size right now. The job record's `logBytes` is a snapshot (refreshed
+ * when the job finalizes); a running job's record is stale by definition, so
+ * `pbb status` reads the file instead of repeating a frozen number.
+ */
+function liveLogBytes(job) {
+  const path = job?.logPath;
+  if (typeof path !== "string" || path === "") return undefined;
+  try {
+    return statSync(path).size;
+  } catch {
+    return undefined;
+  }
+}
+
 function formatJob(job) {
   const age = job.startedAt ? `${Math.max(0, Math.round((Date.now() - Date.parse(job.startedAt)) / 1000))}s` : "?";
   const exit = job.exitCode === undefined || job.exitCode === null ? "" : ` exit=${job.exitCode}`;
@@ -292,7 +307,12 @@ function printStatus(id, jobId, opts) {
     console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "ambiguous_job", matches: result.jobs.length }, `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}`));
     process.exit(3);
   }
-  const job = result.job;
+  const found = result.job;
+  // A *running* job's recorded size is a promotion-time snapshot; read the file.
+  // A finished job's record already carries the final size, and for a capped log
+  // the recorded number is the cap itself — neither may be replaced by a stat.
+  const live = ["running", "kill_requested"].includes(found.status) ? liveLogBytes(found) : undefined;
+  const job = live === undefined ? found : { ...found, logBytes: live };
   if (opts.json) return console.log(json({ kind: "pbb.status", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, job }));
   const cap = formatLogCap(job);
   console.log(context("pbb.status", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, ...(cap ? { log_truncated: true, log_bytes: job.logBytes } : {}), lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, exit_code: job.exitCode, cursor: job.lastEventId }, `${cap ? `${cap}\n` : ""}${json(job)}`));

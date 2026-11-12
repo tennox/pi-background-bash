@@ -132,6 +132,49 @@ test("formatForModel only strips and collapses when pi did not truncate the resu
   assert.doesNotMatch(untouched, /Full output:/);
 });
 
+test("formatForModel reads pi's notice back when pi threw the truncated result away", async () => {
+  // pi's error path (timeout/abort) drops `details`, so the only record that the
+  // full output exists is the notice line pi itself put in the text. Trimming the
+  // text a second time used to append a second footer whose "Full output:" was a
+  // sentence ("bash result trimmed by … context guard") — not a path.
+  const { formatForModel } = await loadLib();
+  const dir = tempDir("thrown");
+  const logPath = join(dir, "pi-bash-real.log");
+  writeFileSync(logPath, "full output lives here\n");
+  const windowLines = Array.from({ length: 2000 }, (_, i) => String(i + 1001));
+  const text = `${windowLines.join("\n")}\n\n[Showing lines 1001-3000 of 3000. Full output: ${logPath}]\n\nCommand timed out after 2 seconds`;
+  try {
+    const formatted = formatForModel({ text, headLines: 3, tailLines: 10 });
+    assert.equal((formatted.match(/\[Showing lines/g) ?? []).length, 1, "exactly one truncation footer");
+    assert.ok(
+      formatted.includes(`[Showing lines 2991-3000 of 3000. Full output: ${logPath}]`),
+      "the footer names pi's real file",
+    );
+    assert.doesNotMatch(formatted, /context guard/);
+    assert.match(formatted, /Command timed out after 2 seconds/, "pi's status line survives and follows the footer");
+    assert.ok(formatted.endsWith("Command timed out after 2 seconds"));
+    assert.equal(formatted.split("\n").slice(0, 3).join("\n"), windowLines.slice(0, 3).join("\n"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("formatForModel leaves a second notice out when pi appended a status after its own", async () => {
+  const { formatForModel } = await loadLib();
+  const windowLines = Array.from({ length: 2000 }, (_, i) => String(i + 1001));
+  const text = `${windowLines.join("\n")}\n\n[Showing lines 1001-3000 of 3000. Full output: /tmp/pi-bash-abc.log]\n\nCommand exited with code 3`;
+  const formatted = formatForModel({
+    text,
+    fullOutputPath: "/home/manu/.pi/pbb/logs/bg001.log",
+    truncation: { truncated: true, truncatedBy: "lines", totalLines: 3000, totalBytes: 40_000, outputLines: 2000 },
+    headLines: 3,
+    tailLines: 10,
+  });
+  assert.equal((formatted.match(/\[Showing lines/g) ?? []).length, 1, "pi's in-body notice must not read as a second footer");
+  assert.match(formatted, /Full output: \/home\/manu\/\.pi\/pbb\/logs\/bg001\.log\]/);
+  assert.ok(formatted.endsWith("Command exited with code 3"), "the status line stays after the footer");
+});
+
 test("formatForModel is idempotent: an already-shaped body passes through unchanged", async () => {
   const { formatForModel } = await loadLib();
   const { text, details } = syntheticTruncatedResult();
@@ -301,6 +344,19 @@ test("the context hook freezes a formatted result across requests", async () => 
   assert.equal(second.messages[0].content[0].text, first.messages[0].content[0].text);
 });
 
+test("the context hook reshapes a result pi truncated and then threw, and invents no footer", async () => {
+  const pi = await loadHook();
+  const windowLines = Array.from({ length: 2000 }, (_, i) => String(i + 1001));
+  const text = `${windowLines.join("\n")}\n\n[Showing lines 1001-3000 of 3000. Full output: /tmp/pi-bash-thrown.log]\n\nCommand timed out after 2 seconds`;
+  // pi's error path: content carries the truncated output, `details` is empty.
+  const result = await pi.emit("context", { messages: [bashResult(text, {})] });
+  const body = result.messages[0].content[0].text;
+  assert.equal((body.match(/\[Showing lines/g) ?? []).length, 1, "exactly one footer in model-facing text");
+  assert.doesNotMatch(body, /context guard/);
+  assert.match(body, /Full output: \/tmp\/pi-bash-thrown\.log\]/);
+  assert.ok(body.endsWith("Command timed out after 2 seconds"));
+});
+
 test("the context hook trims an oversized historical result that carries no full-output path", async () => {
   const pi = await loadHook();
   const huge = [
@@ -310,7 +366,13 @@ test("the context hook trims an oversized historical result that carries no full
   ].join("\n");
   const result = await pi.emit("context", { messages: [bashResult(huge, {})] });
   const body = result.messages[0].content[0].text;
-  assert.match(body, /bash result trimmed by pi-background-bash context guard/);
+  // One owner formats, and it invents no path: there is no full-output file for
+  // this result, so the body says that instead of naming a string that reads
+  // like a path.
+  assert.match(body, /this result was trimmed to keep the request small; no full-output file exists/);
+  assert.doesNotMatch(body, /context guard/);
+  assert.doesNotMatch(body, /Full output:/);
+  assert.equal((body.match(/\[(Showing|output truncated)/g) ?? []).length, 1, "exactly one notice");
   assert.match(body, /HUGE_END should remain/);
   assert.doesNotMatch(body, /HUGE_START should be trimmed away/);
 });

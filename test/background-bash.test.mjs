@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const EXT = new URL("../extensions/background-bash.ts", import.meta.url).pathname;
+const OUTPUT_FORMAT_EXT = new URL("../extensions/output-format.ts", import.meta.url).pathname;
 const PBB_CLI = new URL("../bin/pbb.js", import.meta.url).pathname;
 const PIL_CLI = new URL("../node_modules/pi-lane/bin/pil.js", import.meta.url).pathname;
 const TIMEOUT = 45_000;
@@ -138,7 +139,37 @@ test("bash override truncates verbose foreground results before they enter model
   }
 });
 
-test("context guard trims oversized historical tool results before replay", async () => {
+test("a result pi truncated and then threw carries exactly one footer, naming pi's real path", async () => {
+  // pi throws on a timeout/abort and the agent loop wraps the throw with
+  // `details: {}` — the truncation facts are gone, only pi's notice line in the
+  // text survives. The reshape must read it back instead of trimming the already
+  // truncated text a second time (which used to append a second footer whose
+  // "Full output:" was a sentence, not a path).
+  const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 20 });
+  const mock = await createBgMock(script(
+    sh("seq 1 3000; sleep 5", 2),
+    text("saw the timed-out verbose result"),
+  ), { cwd, extensions: [OUTPUT_FORMAT_EXT] });
+
+  try {
+    await mock.run("run a verbose command that times out", TIMEOUT);
+    // Only the conversation: the request envelope repeats the messages verbatim.
+    const request = JSON.stringify(mock.requests.at(-1)?.messages ?? []);
+    const footers = request.match(/\[Showing lines/g) ?? [];
+    assert.equal(footers.length, 1, `expected exactly one truncation footer, got ${footers.length}`);
+    assert.doesNotMatch(request, /context guard/);
+    const footer = /\[Showing lines \d+-\d+ of \d+\. Full output: ([^"\\]+)\]/.exec(request);
+    assert.ok(footer, "the footer must name the full-output path");
+    assert.ok(existsSync(footer[1]), `the footer names a file that must exist: ${footer[1]}`);
+    assert.match(request, /Command timed out after 2 seconds/, "pi's status line must survive the reshape");
+    assert.match(request, /omitted/);
+  } finally {
+    await mock.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("output-format hook trims an oversized historical result that carries no full-output path", async () => {
   const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-context-guard-${process.pid}-${Date.now()}-`));
   const sessionFile = join(dir, "session.jsonl");
   const now = new Date().toISOString();
@@ -198,13 +229,16 @@ test("context guard trims oversized historical tool results before replay", asyn
   writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
 
   const mock = await createBgMock(script(
-    text("context guard kept request small"),
-  ), { sessionFile, cwd: dir });
+    text("historical tool result kept the request small"),
+  ), { sessionFile, cwd: dir, extensions: [OUTPUT_FORMAT_EXT] });
 
   try {
     await mock.run("continue after huge historical output", TIMEOUT);
     const request = requestText(mock.requests.at(-1));
-    assert.match(request, /bash result trimmed by pi-background-bash context guard/);
+    // One owner formats: the trim comes from the output-format hook, and it never
+    // invents a path — a result with no full-output file says exactly that.
+    assert.match(request, /this result was trimmed to keep the request small; no full-output file exists/);
+    assert.doesNotMatch(request, /context guard/);
     assert.match(request, /HUGE_CONTEXT_END should remain/);
     assert.doesNotMatch(request, /HUGE_CONTEXT_START should be trimmed away/);
     assert.ok(request.length < 180_000, `historical tool result was not capped enough (${request.length} chars)`);
@@ -714,6 +748,19 @@ test("pbb status and pbb tail say the log is capped instead of promising the ful
     );
     const plain = execFileSync(process.execPath, [PBB_CLI, "tail", "bg002"], { env, encoding: "utf8" });
     assert.doesNotMatch(plain, /log capped/);
+
+    // A running job's record only holds the size it had at promotion; `pbb status`
+    // reads the file instead of repeating that frozen number.
+    const runningLog = join(instanceDir, "logs", "bg003.log");
+    writeFileSync(runningLog, "12345678901234567890\n");
+    writeFileSync(
+      join(instanceDir, "jobs", "bg003.json"),
+      JSON.stringify({ jobId: "bg003", globalJobId: "logcap-instance:bg003", status: "running", outcome: "running", exitCode: null, command: "slow", startedAt: new Date().toISOString(), instanceId: "logcap-instance", logPath: runningLog, logBytes: 0 }),
+    );
+    const running = JSON.parse(
+      execFileSync(process.execPath, [PBB_CLI, "status", "bg003", "--json"], { env, encoding: "utf8" }).trim(),
+    );
+    assert.equal(running.job.logBytes, 21, "a running job's size comes from the log file");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1458,7 +1505,7 @@ test("startup sweep re-delivers an undelivered completion exactly once and recor
     logPath: join(logsDir, "bg007.log"),
   };
   writeFileSync(join(jobsDir, "bg007.json"), JSON.stringify(completedJob));
-  writeFileSync(join(logsDir, "bg007.log"), "SWEEP_LOG_TAIL all tests passed\n");
+  writeFileSync(join(logsDir, "bg007.log"), "\u001b]0;window title\u0007progress 10%\rprogress 100%\nSWEEP_LOG_TAIL all tests passed\n");
 
   const gonePid = await deadPid();
   const stuckJob = {
@@ -1511,6 +1558,12 @@ test("startup sweep re-delivers an undelivered completion exactly once and recor
       assert.match(content, /kind="background_bash_digest"/);
       assert.match(content, /\[bg007\] outcome=exit exit_code=0/);
       assert.match(content, /SWEEP_LOG_TAIL/);
+      // A digest body is built from raw log tails, so it needs the same
+      // presentation pass as a completion body: no `ESC]0;…` title sequence and
+      // no `\r` progress frames in the text the model reads.
+      assert.doesNotMatch(content, /\u001b/, "no escape sequence may reach the model");
+      assert.doesNotMatch(content, /\r/, "no carriage return may reach the model");
+      assert.match(content, /progress 100%/, "the last \\r frame survives");
       assert.match(content, /bun test/);
       assert.match(content, /\[bg008\] outcome=lost/);
       assert.match(content, /STUCK_JOB_TAIL/);
@@ -1943,6 +1996,77 @@ test("a job that exceeds maxLogBytes stops logging, records the cap, and says so
       assert.equal(finished.outcome, "exit");
       assert.equal(finished.logTruncated, true);
       assert.equal(finished.logBytes, 4096);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a finished job records the log's real size, not the promotion-time snapshot", async () => {
+  const dir = configuredCwd(0.2);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "log-bytes", sessionFile: join(dir, "bytes.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      // Nothing is written before promotion, so the promotion-time count is 0 and
+      // only the finalize-time stat can report the 11 bytes the job really wrote.
+      const result = await session.bash().execute(
+        "call-bytes",
+        { command: "sleep 0.4; printf 'LATE-BYTES\\n'" },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      const details = result.details;
+      assert.equal(details.outcome, "running", "the call must have been promoted");
+      const instanceDir = join(root, "sessions", details.sessionKey, "instances", details.instanceId);
+      const logPath = join(instanceDir, "logs", "bg001.log");
+      const jobPath = join(instanceDir, "jobs", "bg001.json");
+
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+      const finished = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(finished.status, "exited");
+      const size = statSync(logPath).size;
+      assert.ok(size > 0, "the log must hold the command's output");
+      assert.equal(finished.logBytes, size, "the record must carry the log's final size");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a completion body strips escape sequences and carriage-return frames", async () => {
+  const dir = configuredCwd(0.2);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "completion-escapes", sessionFile: join(dir, "esc.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+      const started = await session.bash().execute(
+        "call-escapes",
+        // After promotion: the escape/CR frames have to travel through the log and
+        // the completion body, which is where they used to reach the model raw.
+        { command: "sleep 0.4; printf '\\033]0;window title\\007progress 10%%\\rprogress 100%%\\nESCAPE-DONE\\n'" },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      assert.equal(started.details.outcome, "running", "the call must have been promoted");
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+      const body = String(session.messages.at(-1).message.content);
+      const inner = body.slice(body.indexOf(">") + 1);
+      assert.match(inner, /ESCAPE-DONE/);
+      assert.match(inner, /progress 100%/, "the last \\r frame is the one the reader saw");
+      assert.doesNotMatch(inner, /\u001b/, "no escape sequence may reach the model");
+      assert.doesNotMatch(inner, /\r/, "no carriage return may reach the model");
+      assert.doesNotMatch(inner, /progress 10%/, "an overwritten frame is not output");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

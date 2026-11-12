@@ -4,15 +4,15 @@ import { accessSync, appendFileSync, chmodSync, closeSync, constants as fsConsta
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AgentToolUpdateCallback, BashOperations, BashToolDetails, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text } from "@earendil-works/pi-tui";
 import { createPiPending, type PiPendingRegistry } from "pi-pending";
 import { type TObject, Type } from "typebox";
 import { type ChildExit, exitCodeFrom, JOB_EXIT_STDIO_GRACE_MS, waitForChildExit } from "../lib/child-exit.ts";
-import { capBodyToPiWindow, formatLogFile, loadOutputFormatConfig } from "../lib/output-format.ts";
-import { formatTruncationNotice, piContext, truncateContextText } from "./pi-context-utils.ts";
+import { capBodyToPiWindow, formatLogFile, loadOutputFormatConfig, presentText } from "../lib/output-format.ts";
+import { piContext } from "./pi-context-utils.ts";
 
 const MAX_ACTIVE_JOBS = 10;
 // pi's own truncation window (`truncate.ts`): completion bodies are capped the
@@ -661,6 +661,20 @@ function recordPbbJobStarted(job: ActiveJob, cwd: string, patch: Record<string, 
 }
 
 /**
+ * The log's real size on disk. `job.logBytes` is a promotion-time snapshot (it
+ * is what the cap checks against while the command runs), so a finished job's
+ * record must be refreshed from the file or it keeps saying `0` forever.
+ */
+function logBytesOnDisk(job: ActiveJob): number | undefined {
+	if (!job.logPath) return undefined;
+	try {
+		return statSync(job.logPath).size;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Persist the real outcome. `delivered` starts false so the reconcile sweep can
  * tell "recorded but never reached the agent" apart from "delivered".
  *
@@ -671,6 +685,8 @@ function recordPbbJobStarted(job: ActiveJob, cwd: string, patch: Record<string, 
 function recordPbbJobCompleted(job: ActiveJob, result: JobResult, cwd: string, durationMs: number): void {
 	if (!job.pbb) return;
 	appendPbbEvent(job, "job.completed", { outcome: result.outcome, exitCode: result.exitCode, durationMs });
+	const logBytes = logBytesOnDisk(job);
+	if (logBytes !== undefined) job.logBytes = logBytes;
 	writePbbJob(job, {
 		cwd,
 		status: result.outcome === "exit" ? "exited" : result.outcome,
@@ -1084,51 +1100,8 @@ export function createBashExec(options: BashExecOptions): BashExec {
 }
 
 
-function shouldTruncateBody(body: string): boolean {
-	return Boolean(truncateContextText(body, { mode: "tail", maxLines: MAX_RESULT_LINES, maxBytes: MAX_RESULT_BYTES, appendNotice: false }).truncation?.truncated);
-}
-
 function escapePiContextClosingTags(text: string): string {
 	return text.replace(/<\/pi_context>/gi, "<\\/pi_context>");
-}
-
-function addFullOutputHintToNotice(notice: string, fullOutputHint: string): string {
-	return notice.endsWith("]") ? `${notice.slice(0, -1)}. Full output: ${fullOutputHint}]` : `${notice} Full output: ${fullOutputHint}`;
-}
-
-function truncateBodyWithHint(body: string, fullOutputHint: string): string {
-	const { content, truncation } = truncateContextText(body, { mode: "tail", maxLines: MAX_RESULT_LINES, maxBytes: MAX_RESULT_BYTES, appendNotice: false });
-	if (!truncation?.truncated) return body;
-	return `${escapePiContextClosingTags(content)}\n\n${addFullOutputHintToNotice(formatTruncationNotice(truncation, "tail"), fullOutputHint)}`;
-}
-
-function trimOversizedToolResultsForContext(messages: AgentMessage[]): AgentMessage[] | undefined {
-	let changed = false;
-	const next = messages.map((message) => {
-		const record = asRecord(message);
-		if (record?.role !== "toolResult") return message;
-		// A result pi itself truncated is not an oversized historical result: it is
-		// already pi's window, and `extensions/output-format.ts` reshapes it into
-		// head+tail. Trimming it here would eat the head and stack a second notice.
-		const details = asRecord(record.details);
-		if (details?.fullOutputPath || details?.truncation) return message;
-		const content = Array.isArray(record.content) ? record.content : [];
-		let contentChanged = false;
-		const nextContent = content.map((part) => {
-			const item = asRecord(part);
-			if (item?.type !== "text" || typeof item.text !== "string" || !shouldTruncateBody(item.text)) return part;
-			contentChanged = true;
-			const toolName = typeof record.toolName === "string" ? record.toolName : "tool";
-			return {
-				...part,
-				text: truncateBodyWithHint(item.text, `${toolName} result trimmed by pi-background-bash context guard`),
-			};
-		});
-		if (!contentChanged) return message;
-		changed = true;
-		return { ...message, content: nextContent } as AgentMessage;
-	});
-	return changed ? next : undefined;
 }
 
 /** Where a call's full output lives. Job calls: the instance log dir. */
@@ -1514,7 +1487,16 @@ function sendCompletionDigest(session: SessionState, entries: ReconcileEntry[], 
 			jobs: entries.length,
 			deferred: deferred > 0 ? deferred : undefined,
 		},
-		body: escapePiContextClosingTags(truncateBodyWithHint(body, "pbb tail <job> --scope session --full")),
+		body: escapePiContextClosingTags(
+			// Presentation is part of the formatting layer (PLAN §7a): a digest body
+			// carries raw log tails, so it gets the same escape/CR pass and pi's window
+			// as a completion body — never a raw `ESC]0;…` title sequence.
+			capBodyToPiWindow(presentText(body), {
+				maxLines: MAX_RESULT_LINES,
+				maxBytes: MAX_RESULT_BYTES,
+				fullOutputPath: "pbb tail <job> --scope session --full",
+			}),
+		),
 	});
 	const summaries: DigestJobSummary[] = entries.map((entry) => ({
 		jobId: String(entry.job.jobId),
@@ -1897,11 +1879,6 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		session.pending.detach();
 		liveSessions.delete(session);
 		stopKillRequestPollingIfIdle();
-	});
-
-	pi.on("context", (event) => {
-		const messages = trimOversizedToolResultsForContext(event.messages);
-		if (messages) return { messages };
 	});
 
 	// pi's own bash tool, driven by our `operations.exec` (PLAN §5). The factory

@@ -57,17 +57,21 @@ command does, what the log holds, or what the TUI shows.
   keeps only its last `\r` frame, so a progress bar reads as its final state instead of 2000 frames;
 - a result pi itself truncated (`details.truncation` / `details.fullOutputPath`) is reshaped to the
   **first 3 lines + `… N lines / <size> omitted …` + the last 10 lines + `Full output: <path>`**, with the
-  counts taken from pi's own truncation numbers. Results pi did not truncate pass through
+  counts taken from pi's own truncation numbers. A *failed* command is truncated by pi too but comes
+  back without `details` (pi throws, the agent loop wraps the throw), so the reshape also reads pi's
+  own notice line back and reuses the real path it names. Results pi did not truncate pass through
   byte-for-byte: this layer has no size budget of its own and can never make a result tighter than
   builtin bash;
-- an oversized *historical* result that carries no full-output path is trimmed by the context guard
-  (pi's 2000-line/50 KB window, tail kept), as before;
+- an oversized *historical* result that carries no full-output path is trimmed by the size guard in
+  the same hook (pi's 2000-line/50 KB window, tail kept); it says that no full-output file exists
+  instead of naming a path it does not have. `extensions/background-bash.ts` registers no `context`
+  hook of its own — the output layer is the single owner of model-facing truncation;
 - each body is computed **once** and frozen for the session, keyed by its `toolCallId` — re-deriving
   from a log that is still growing would move text under an already-sent prompt prefix.
 
-A completion body is capped like a pi tool result and names `pbb tail <job> --full`. A job whose log
-hit `maxLogBytes` is instead reshaped from the log's first and last bytes and says explicitly that
-its tail is not the true end of the output.
+A completion body is capped like a pi tool result and names `pbb tail <job> --full`; a boot digest
+body gets the same treatment. A job whose log hit `maxLogBytes` is instead reshaped from the log's
+first and last bytes and says explicitly that its tail is not the true end of the output.
 
 **What the log holds.** The log stays raw: exactly the command's bytes, nothing added. Neither the
 cap nor any formatting marker is ever written into it, so `pbb tail`, `rg`, and every other reader
