@@ -8,6 +8,9 @@ PBB is the baseline bash runner for pi-background-bash v1.
 - Background jobs are owned by PBB from process start, and owned *per session*: one pi process serves several sessions (`/new`, `/resume`, subagents) and each owns only its own jobs.
 - Job IDs use fixed-width local IDs: `bg001`, `bg002`, ..., `bg999`, then `bg1000`. IDs are unique per instance directory; the allocator is process-wide so two sessions sharing an instance directory cannot collide.
 - Jobs record `pid` and `pgid` for process-group control.
+- A session runs at most `maxActiveJobs` (default 20, configurable globally and per project)
+  background jobs; a call past the cap is refused with a message pointing at `pbb kill <jobid>`,
+  so the model frees a slot instead of waiting for one job to end.
 - `pbb list`, `pbb status` and `pbb tail` inspect the recorded job state/logs.
 - `pbb kill` requests live owner shutdown through the instance mailbox.
 - `pbb kill --stale --instance <id> <job>` explicitly signals a stale recorded process group.
@@ -44,13 +47,20 @@ it), and `--instance` selects the new scope value `instance` plus an `instance` 
 
 `pbb` reports the owning runtime as `owner=live|stale|dead|unknown`:
 
-1. **pi-lane record** (when pi-lane is installed and has seen that instance): `live`/`stale`
-   per its heartbeat and status — unchanged from before.
-2. **instance pid** (no pi-lane record — the normal case on installs without pi-lane, where the
-   instance id is pbb's `pbb_<pid>_<hash>` fallback): the pid from the instance's own
-   `identity.json` (or from that id) is probed with `kill(pid, 0)`. The process exists →
-   `owner=live`; it is gone → `owner=dead (pid N is gone)`. On Linux the process start time is
-   compared with `identity.json`'s `updatedAt` so a recycled pid is reported as dead, not live.
+1. **pi-lane record** (when the packaged `pi-lane` dependency has seen that instance):
+   `live`/`stale` per its heartbeat and status — unchanged from before. `pbb` resolves the
+   `pil` CLI through Node's module resolution (`PBB_PIL_BIN` overrides it) with the
+   package-local `node_modules/pi-lane` path as the fallback, so it is found both in a plain
+   `npm install` of this package and in pi's npm install, where dependencies are hoisted to
+   `~/.config/pi/npm/node_modules`. A `pil` that cannot be resolved or fails is a hard failure
+   (exit 4, `pi_lane_unavailable`) with instructions, not a silent downgrade to `unknown`.
+2. **instance pid** (no pi-lane record — the normal case when pi-lane is not driving the
+   session, where the instance id is pbb's `pbb_<pid>_<hash>` fallback): the pid in the
+   instance's own `identity.json`, which this extension writes whenever it records a job
+   event (the `pbb_<pid>_…` id is the second fallback source), is probed with `kill(pid, 0)`.
+   The process exists → `owner=live`; it is gone → `owner=dead (pid N is gone)`. On Linux the
+   process start time is compared with `identity.json`'s `updatedAt` so a recycled pid is
+   reported as dead, not live.
 3. **no source**: `owner=unknown`, with the reason — pbb lacking a liveness source is not
    evidence that the owner is gone, so it never claims `stale`.
 
@@ -72,6 +82,9 @@ Delivery bookkeeping is recorded on the file:
 | `lostReason` | set when the owner process died before recording a completion; the outcome is `lost` and is **never** fabricated as `exit` |
 | `logBytes` | bytes the log holds; stops growing at `maxLogBytes` |
 | `logTruncated` | `true` once the log hit `maxLogBytes` and appending stopped |
+| `promotedAt` / `promotedAfterSeconds` / `promotionThresholdSeconds` | when and how the call became a job (`0` threshold = explicit `background: true`); kept on the finished record, not just the promotion-time write |
+| `killRequestedAt` | when a `pbb kill` request asked this job to stop; kept on the finished record |
+| `killSignal` | the signal the kill request asked for |
 
 ## Log hygiene
 
@@ -100,10 +113,14 @@ command does, what the log holds, or what the TUI shows.
 - ANSI/CSI/OSC sequences and control characters are stripped (`\n` and `\t` stay), and each line
   keeps only its last `\r` frame, so a progress bar reads as its final state instead of 2000 frames;
 - a result pi itself truncated (`details.truncation` / `details.fullOutputPath`) is reshaped to the
-  **first 3 lines + `… N lines / <size> omitted …` + the last 10 lines + `Full output: <path>`**, with the
-  counts taken from pi's own truncation numbers. A *failed* command is truncated by pi too but comes
+  **first 3 lines + `… N lines / <size> omitted …` + the last 10 lines + `Full output: <path>`**.
+  Both ends are read from the full-output file, so the head is the command's own first lines —
+  pi's text alone starts at the first line of its *tail* window (line 1001 of a 3000-line result).
+  The marker counts the lines *absent from the body* (pi's total minus the lines shown), not the
+  lines between the shown head and tail. A *failed* command is truncated by pi too but comes
   back without `details` (pi throws, the agent loop wraps the throw), so the reshape also reads pi's
-  own notice line back and reuses the real path it names. Results pi did not truncate pass through
+  own notice line back and reuses the real path it names. Without a readable full-output file, the
+  head falls back to the head of pi's window. Results pi did not truncate pass through
   byte-for-byte: this layer has no size budget of its own and can never make a result tighter than
   builtin bash;
 - an oversized *historical* result that carries no full-output path is trimmed by the size guard in

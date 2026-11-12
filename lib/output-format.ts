@@ -10,9 +10,11 @@
  *      sequences. No size budget, no path rewriting, no exceptions.
  *  (b) head+tail reshape — applied only where pi already decided the output was
  *      truncated (`details.truncation` / `details.fullOutputPath`) or where a job
- *      log hit `maxLogBytes`. Everything else passes through byte-for-byte, so
- *      this layer can never make a result tighter than builtin bash
- *      (COMPARISON.md decision 6).
+ *      log hit `maxLogBytes`. Both ends are read from the full-output file when
+ *      it is readable — the head of pi's tail window is line 1001, not line 1 —
+ *      so the model sees the command's own first lines. Everything else passes
+ *      through byte-for-byte, so this layer can never make a result tighter than
+ *      builtin bash (COMPARISON.md decision 6).
  *
  * Deliberately dependency-free (only `node:*`): no import from pi, so the tests
  * need no pi runtime and this module cannot quietly grow into owning pi's
@@ -167,7 +169,7 @@ export function formatSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-/** Rounded human bytes, matching the job layer's `formatBytes` ("4 KB", "100 MB"). */
+/** Rounded human bytes for notices ("4 KB", "100 MB"). */
 export function humanBytes(bytes: number): string {
 	if (!Number.isFinite(bytes) || bytes < 0) return "an unknown size";
 	if (bytes >= 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`;
@@ -364,6 +366,80 @@ function splitNotices(text: string, tailLines: number): SplitNotices {
 	return { body: lines.join("\n"), ...(notice === undefined ? {} : { notice }), trailing };
 }
 
+interface FileHeadTailOptions {
+	headLines: number;
+	tailLines: number;
+	/**
+	 * Byte length of the truncated body we were handed. A file that really holds
+	 * the full output cannot be smaller than the truncated window of it, so a
+	 * smaller file is not that file (e.g. pi's stale temp path in a replayed
+	 * transcript) and must not supply the head.
+	 */
+	minBytes: number;
+	maxBytes?: number;
+}
+
+/**
+ * Read both ends of the full-output file — the head of the *command*, not the
+ * head of pi's tail window (COMPARISON.md decision 5).
+ *
+ * pi's own text carries only its tail window, so the first line of an
+ * unreshaped `seq 1 3000` result is line 1001. The full output is on disk
+ * (`details.fullOutputPath`, or the path in pi's notice), so the head is read
+ * from there; only the first and last `maxBytes` of the file are read, never the
+ * whole file.
+ *
+ * Returns `undefined` when there is nothing better than the text window: no
+ * path, an unreadable/unreasonably small file, a first line longer than the
+ * whole window, or a file that holds no more lines than the body would show
+ * anyway. Callers then keep the old behaviour (shape the text they were given).
+ */
+function headTailFromFile(path: string | undefined, options: FileHeadTailOptions): { head: string; tail: string } | undefined {
+	if (!path) return undefined;
+	const { headLines, tailLines, minBytes } = options;
+	const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_OUTPUT_FORMAT.maxBytes);
+	let size: number;
+	try {
+		size = statSync(path).size;
+	} catch {
+		return undefined;
+	}
+	if (size <= 0) return undefined;
+	if (minBytes > 0 && size < minBytes) return undefined;
+	if (size <= maxBytes) {
+		let text: string;
+		try {
+			text = readBytes(path, 0, size).toString("utf8");
+		} catch {
+			return undefined;
+		}
+		const lines = splitLines(presentText(text));
+		if (lines.length <= headLines + tailLines) return undefined;
+		return {
+			head: lines.slice(0, headLines).join("\n"),
+			tail: lines.slice(Math.max(0, lines.length - tailLines)).join("\n"),
+		};
+	}
+	let headWindow: string;
+	let tailText: string;
+	try {
+		headWindow = decodeHeadWindow(readBytes(path, 0, maxBytes));
+		tailText = readTailWindow(path, size, maxBytes);
+	} catch {
+		return undefined;
+	}
+	const headPresented = presentText(headWindow);
+	const lastNewline = headPresented.lastIndexOf("\n");
+	// Only complete lines count: the end of the head window is cut mid-line.
+	const headLinesAll = splitLines(lastNewline > 0 ? headPresented.slice(0, lastNewline) : "");
+	if (headLinesAll.length < headLines) return undefined;
+	const tailLinesAll = splitLines(presentText(tailText));
+	return {
+		head: headLinesAll.slice(0, headLines).join("\n"),
+		tail: tailLinesAll.slice(Math.max(0, tailLinesAll.length - tailLines)).join("\n"),
+	};
+}
+
 /**
  * The model-facing body for one bash result.
  *
@@ -375,10 +451,14 @@ function splitNotices(text: string, tailLines: number): SplitNotices {
  * through with presentation only. An already-shaped body (one carrying our
  * marker) is returned unchanged.
  *
+ * The head and the tail come from the full-output file when it is readable, so
+ * the model sees the command's own first and last lines; without a usable file
+ * they come from the text pi handed over, whose head is the head of pi's tail
+ * window rather than of the command.
+ *
  * The omitted counts come from pi's own numbers (`totalLines`/`totalBytes`),
- * never from the text handed in: the head we can show is the head of pi's
- * *window* (core keeps the tail), so the bytes between our head and tail are
- * exactly what pi's totals say is missing.
+ * never from the text handed in: they count the lines (and bytes) *absent from
+ * the body*, not the lines between the shown head and the shown tail.
  */
 export function formatForModel(options: FormatForModelOptions): string {
 	const text = options.text;
@@ -412,8 +492,17 @@ export function formatForModel(options: FormatForModelOptions): string {
 		return presented;
 	}
 
-	const head = headLines > 0 ? lines.slice(0, headLines).join("\n") : "";
-	const tail = tailLines > 0 ? lines.slice(lines.length - tailLines).join("\n") : "";
+	// The full-output file is the only route to the command's real head: pi's
+	// text starts with the first line of its tail window (line 1001 of a
+	// 3000-line result). Without a usable file, this keeps the old behaviour and
+	// takes the head from the text it was given.
+	const fromFile = headTailFromFile(fullOutputPath, {
+		headLines,
+		tailLines,
+		minBytes: Buffer.byteLength(body, "utf8"),
+	});
+	const head = fromFile ? fromFile.head : headLines > 0 ? lines.slice(0, headLines).join("\n") : "";
+	const tail = fromFile ? fromFile.tail : tailLines > 0 ? lines.slice(lines.length - tailLines).join("\n") : "";
 	const totalLines = truncation?.totalLines !== undefined && truncation.totalLines >= lines.length ? truncation.totalLines : lines.length;
 	const omittedLines = Math.max(0, totalLines - (headLines + tailLines));
 	const keptBytes = Buffer.byteLength(head, "utf8") + Buffer.byteLength(tail, "utf8");

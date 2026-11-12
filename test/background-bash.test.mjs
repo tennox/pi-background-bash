@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -163,6 +163,17 @@ test("a result pi truncated and then threw carries exactly one footer, naming pi
     assert.ok(existsSync(footer[1]), `the footer names a file that must exist: ${footer[1]}`);
     assert.match(request, /Command timed out after 2 seconds/, "pi's status line must survive the reshape");
     assert.match(request, /omitted/);
+
+    // The head must be the command's own first lines (1, 2, 3), not the first
+    // lines of pi's tail window (1001-1003) — the head is read from the
+    // full-output file the footer names.
+    const shaped = messageTexts(mock.requests.at(-1)).find((body) => body.includes("Full output:"));
+    assert.ok(shaped, "the reshaped bash result must be in the request");
+    assert.deepEqual(
+      shaped.split("\n").slice(0, 3),
+      ["1", "2", "3"],
+      "the head must be the command's first lines, not the head of pi's window",
+    );
   } finally {
     await mock.close();
     rmSync(cwd, { recursive: true, force: true });
@@ -991,6 +1002,9 @@ test("pbb kill honors --signal for live current-instance jobs", async () => {
     await waitForCondition(() => existsSync(jobPath) && JSON.parse(readFileSync(jobPath, "utf8")).outcome === "abort");
     const job = JSON.parse(readFileSync(jobPath, "utf8"));
     assert.equal(job.killSignal, "SIGKILL");
+    // The kill request is part of the finished record (PLAN §6): the completion
+    // write used to wipe it.
+    assert.match(String(job.killRequestedAt), /^\d{4}-\d{2}-\d{2}T/, "killRequestedAt must survive the completion write");
     assert.equal(existsSync(marker), false);
   } finally {
     await mock.close();
@@ -1913,6 +1927,12 @@ test("promotion answers just after the threshold and the same job id reaches res
       const finishedJob = JSON.parse(readFileSync(jobPath, "utf8"));
       assert.equal(finishedJob.outcome, "exit");
       assert.equal(finishedJob.exitCode, 0);
+      // PLAN §6 keeps the promotion metadata: the completion write rebuilds the
+      // record, so these must live on the job rather than in the promotion patch
+      // (they used to be null on every finished job).
+      assert.equal(finishedJob.promotedAt, runningJob.promotedAt, "promotedAt must survive the completion write");
+      assert.equal(finishedJob.promotedAfterSeconds, runningJob.promotedAfterSeconds);
+      assert.equal(finishedJob.promotionThresholdSeconds, 0.3);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2046,6 +2066,13 @@ test("the tool description promises no log for every command and no pbb tail for
     assert.match(description, /a truncated result names the log file/);
     assert.match(description, /Set background: true[^.]*job id \(usable with pbb status\/tail\)/);
 
+    // COMPARISON.md decision 5: the description must say what the model actually
+    // sees — head + omitted marker + tail — instead of promising a tail-only cut.
+    assert.doesNotMatch(description, /truncated to the last/i, "the model sees head and tail, not only the tail");
+    assert.match(description, /first few and last few lines/);
+    assert.match(description, /… N lines omitted …/);
+    assert.match(description, /names the log file that holds the command's output/);
+
     // The old wording: "the full output of every command is written to its job
     // log" — false, a small foreground result's log is discarded.
     assert.doesNotMatch(description, /full output of every command/i);
@@ -2059,6 +2086,11 @@ test("the tool description promises no log for every command and no pbb tail for
     const guidelines = (tool.promptGuidelines ?? []).join("\n");
     assert.doesNotMatch(guidelines, /full output of every command/i);
     assert.doesNotMatch(guidelines, /readable (with|via) pbb tail/i);
+    // Scoping wording: `--scope session` only widens to sibling *instances* of
+    // this session; other sessions (siblings, subagents) need `--scope all`.
+    assert.doesNotMatch(guidelines, /--scope session` for sibling sessions/i);
+    assert.match(guidelines, /`--scope session`/);
+    assert.match(guidelines, /other sessions[^.]*`--scope all`/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2300,4 +2332,165 @@ test("session start deletes job logs past the retention window, but never a runn
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+// PLAN §10: `maxActiveJobs` replaces the hard-coded 10, and the refusal must tell
+// the model how to free a slot instead of only "wait for one to finish".
+test("maxActiveJobs is configurable and the refusal points at pbb kill", async () => {
+  const dir = configuredCwd(60, { maxActiveJobs: 1 });
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "max-active", sessionFile: join(dir, "max-active.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+
+      const first = await session.bash().execute(
+        "call-cap-1",
+        { command: "sleep 0.6", background: true },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      assert.equal(first.details.outcome, "running", "the first job must have been promoted");
+
+      await assert.rejects(
+        () =>
+          session.bash().execute(
+            "call-cap-2",
+            { command: "echo second", background: true },
+            undefined,
+            undefined,
+            session.ctx,
+          ),
+        (error) => {
+          assert.match(error.message, /Too many bash jobs running \(1\/1\)/);
+          assert.match(error.message, /pbb kill <jobid>/, "the refusal must say how to free a slot");
+          return true;
+        },
+      );
+
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * A fake installed package layout: `root/node_modules/pi-lane` with a `pil` CLI
+ * that answers `instances --json` the way pi-lane does. Its package.json mirrors
+ * pi-lane's `exports` map, which does NOT expose `bin/pil.js` — the exact reason
+ * the old fixed `<pkg>/node_modules/pi-lane` path failed.
+ */
+function writeFakePiLane(packageDir) {
+  mkdirSync(join(packageDir, "bin"), { recursive: true });
+  writeFileSync(
+    join(packageDir, "package.json"),
+    JSON.stringify({ name: "pi-lane", version: "0.0.0", type: "module", exports: { ".": "./index.ts" } }),
+  );
+  writeFileSync(join(packageDir, "index.ts"), "export {};\n");
+  writeFileSync(
+    join(packageDir, "bin", "pil.js"),
+    [
+      "console.log(JSON.stringify({ instances: [{",
+      "  instanceId: process.env.PI_LANE_INSTANCE_ID,",
+      "  status: 'running',",
+      "  live: true,",
+      "  lastSeenAt: new Date().toISOString(),",
+      "}] }));",
+    ].join("\n"),
+  );
+}
+
+function seedPbbJob(pbbRoot, sessionKey, instanceId) {
+  const jobsDir = join(pbbRoot, "sessions", sessionKey, "instances", instanceId, "jobs");
+  mkdirSync(jobsDir, { recursive: true });
+  writeFileSync(
+    join(jobsDir, "bg001.json"),
+    JSON.stringify({
+      jobId: "bg001",
+      globalJobId: `${instanceId}:bg001`,
+      status: "running",
+      command: "job from a hoisted install",
+      startedAt: new Date().toISOString(),
+      instanceId,
+    }),
+  );
+}
+
+// Fix for the README's own recommended install path: pi's npm install hoists
+// `pi-lane` next to `pi-background-bash`, so `<pkg>/node_modules/pi-lane` does not
+// exist and every `pbb` command exited 4 `pi_lane_unavailable`. Both layouts must
+// resolve: the hoisted one (module resolution) and the nested one (fallback).
+test("pbb resolves pil in a hoisted npm layout and in a nested one", () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-layout-${process.pid}-${Date.now()}-`));
+  try {
+    const cases = [
+      // pi install npm:pi-background-bash → both packages side by side
+      { name: "hoisted", packageDir: join(dir, "hoisted", "node_modules", "pi-background-bash"), laneDir: join(dir, "hoisted", "node_modules", "pi-lane") },
+      // a plain `npm install` inside the package → dependency nested in it
+      { name: "nested", packageDir: join(dir, "nested", "node_modules", "pi-background-bash"), laneDir: join(dir, "nested", "node_modules", "pi-background-bash", "node_modules", "pi-lane") },
+    ];
+
+    for (const { name, packageDir, laneDir } of cases) {
+      mkdirSync(join(packageDir, "bin"), { recursive: true });
+      copyFileSync(PBB_CLI, join(packageDir, "bin", "pbb.js"));
+      writeFakePiLane(laneDir);
+
+      const sessionKey = `layout-${name}`;
+      const instanceId = `instance-${name}`;
+      const pbbRoot = join(dir, `pbb-${name}`);
+      seedPbbJob(pbbRoot, sessionKey, instanceId);
+
+      const env = {
+        ...process.env,
+        PBB_ROOT: pbbRoot,
+        PI_LANE_SESSION_KEY: sessionKey,
+        PI_LANE_SESSION_ID: `session-${name}`,
+        PI_LANE_INSTANCE_ID: instanceId,
+        PI_LANE_CURRENT_LANE: "main",
+      };
+      delete env.PBB_PIL_BIN;
+
+      const out = execFileSync(process.execPath, [join(packageDir, "bin", "pbb.js"), "list"], {
+        env,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.match(out, /bg001/, `${name} layout: pbb list must find the job`);
+      assert.match(out, /owner=live/, `${name} layout: the fake pil instance must be used`);
+      assert.doesNotMatch(out, /pi_lane_unavailable/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// PLAN §11 item 9: the `files` allowlist must ship the code the entry points
+// import. `npm pack --dry-run` is local: no registry, no tarball written.
+test("the published package ships lib/, both extension entries and the pbb CLI", () => {
+  const repoRoot = new URL("..", import.meta.url).pathname;
+  const [manifest] = JSON.parse(
+    execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 120_000,
+    }),
+  );
+  const files = new Set((manifest.files ?? []).map((entry) => entry.path));
+  for (const required of ["index.ts", "extensions/background-bash.ts", "bin/pbb.js"]) {
+    assert.ok(files.has(required), `${required} must be in the published package`);
+  }
+  // Both extension entry points: the runner and the model-facing output layer.
+  assert.ok(files.has("extensions/output-format.ts"), "extensions/output-format.ts must be published");
+  assert.ok(files.has("lib/output-format.ts"), "lib/ must be published: both extensions import it");
+  assert.ok(files.has("lib/child-exit.ts"), "lib/child-exit.ts must be published");
+  assert.ok(files.has("extensions/pi-context-utils.ts"), "extensions/pi-context-utils.ts is imported by both entries");
+
+  const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+  assert.deepEqual(pkg.pi.extensions, ["./index.ts", "./extensions/output-format.ts"]);
 });

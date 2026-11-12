@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +10,9 @@ import { fileURLToPath } from "node:url";
 const SCHEMA_VERSION = 1;
 const DEFAULT_TAIL_LINES = 80;
 const HERE = dirname(fileURLToPath(import.meta.url));
-const TRACKED_PIL_BIN = join(HERE, "..", "node_modules", "pi-lane", "bin", "pil.js");
+// The non-hoisted copy of pi-lane. Kept last: it only exists when this package
+// was installed into its own directory, not in the npm install layout pi uses.
+const NESTED_PIL_BIN = join(HERE, "..", "node_modules", "pi-lane", "bin", "pil.js");
 
 function attr(value) {
   return String(value ?? "")
@@ -103,6 +106,48 @@ function readJson(path) {
 
 let pilInstancesCache;
 
+/**
+ * Where pi-lane's `pil` CLI lives.
+ *
+ * `<pkg>/node_modules/pi-lane/bin/pil.js` is only true of a non-hoisted install.
+ * pi's npm install (`pi install npm:pi-background-bash`) puts this package and
+ * its dependencies side by side under `~/.config/pi/npm/node_modules`, so the
+ * nested path does not exist there and every command used to exit 4
+ * `pi_lane_unavailable` — in the README's own recommended install path. Use
+ * Node's module resolution instead, which walks up to the hoisted location.
+ */
+function pilBinCandidates() {
+  const candidates = [];
+  try {
+    const require = createRequire(import.meta.url);
+    try {
+      candidates.push(require.resolve("pi-lane/bin/pil.js"));
+    } catch {
+      // pi-lane's `exports` map does not expose `bin/pil.js` (only "." and
+      // "./runtime"), so resolve the package entry and walk up to its root.
+      let dir = dirname(require.resolve("pi-lane"));
+      for (let depth = 0; depth < 4 && dir !== dirname(dir); depth += 1) {
+        const manifest = join(dir, "package.json");
+        if (existsSync(manifest)) {
+          try {
+            if (JSON.parse(readFileSync(manifest, "utf8")).name === "pi-lane") {
+              candidates.push(join(dir, "bin", "pil.js"));
+              break;
+            }
+          } catch {
+            // Unreadable manifest: keep walking up.
+          }
+        }
+        dir = dirname(dir);
+      }
+    }
+  } catch {
+    // pi-lane is not resolvable at all (pruned install): the nested path is next.
+  }
+  candidates.push(NESTED_PIL_BIN);
+  return [...new Set(candidates)];
+}
+
 function failPil(id, message, error) {
   const detail = error instanceof Error ? error.message : String(error || "");
   console.error(context("pbb.error", {
@@ -115,10 +160,15 @@ function failPil(id, message, error) {
 
 function pilCommand(id) {
   if (process.env.PBB_PIL_BIN) return { file: process.env.PBB_PIL_BIN, args: [] };
-  if (!existsSync(TRACKED_PIL_BIN)) {
-    failPil(id, `tracked pi-lane pil binary is missing: ${TRACKED_PIL_BIN}`);
+  const candidates = pilBinCandidates();
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) {
+    failPil(
+      id,
+      `cannot find pi-lane's pil CLI (looked in: ${candidates.join(", ")}).\npi-lane is a dependency of pi-background-bash, so this is a broken install: reinstall the package (\`npm install\` inside it, or \`pi install npm:pi-background-bash\`), or set PBB_PIL_BIN to the path of pi-lane's bin/pil.js.`,
+    );
   }
-  return { file: process.execPath, args: [TRACKED_PIL_BIN] };
+  return { file: process.execPath, args: [found] };
 }
 
 /**

@@ -107,7 +107,9 @@ test("formatForModel reshapes a pi-truncated result to head + omitted marker + t
   });
 
   const lines = formatted.split("\n");
-  assert.deepEqual(lines.slice(0, 3), windowLines.slice(0, 3), "head keeps the first 3 lines of pi's window");
+  // No readable full-output file (that path does not exist), so the reshape falls
+  // back to the head of pi's window — the pre-file behaviour.
+  assert.deepEqual(lines.slice(0, 3), windowLines.slice(0, 3), "without a file the head falls back to pi's window head");
   const marker = lines.find((line) => line.includes("omitted"));
   assert.ok(marker, "an omitted marker line must be present");
   // Counts come from pi's own numbers (10050 total), never from the text we were given.
@@ -120,6 +122,37 @@ test("formatForModel reshapes a pi-truncated result to head + omitted marker + t
   assert.match(lines.at(-1), /^\[Showing lines 10041-10050 of 10050\. Full output: \/tmp\/pi-bash-abc\.log\]$/);
   // pi's own, now-stale notice line must not survive inside the tail.
   assert.equal(formatted.match(/\[Showing lines/g).length, 1);
+});
+
+test("formatForModel takes the head from the full-output file, not from pi's tail window", async () => {
+  // Live acceptance finding: `seq 1 3000` showed "first 3 lines" = 1001-1003,
+  // because pi's text starts at the first line of its *tail* window. The full
+  // output is on disk, so both ends are read from there (COMPARISON decision 5).
+  const { formatForModel } = await loadLib();
+  const dir = tempDir("file-head");
+  const logPath = join(dir, "bg001.log");
+  const all = Array.from({ length: 3000 }, (_, i) => `line-${i + 1}`);
+  writeFileSync(logPath, `${all.join("\n")}\n`);
+  const window = all.slice(1000);
+  const text = `${window.join("\n")}\n\n[Showing lines 1001-3000 of 3000. Full output: ${logPath}]`;
+  try {
+    const body = formatForModel({
+      text,
+      fullOutputPath: logPath,
+      truncation: { truncated: true, truncatedBy: "lines", totalLines: 3000, outputLines: 2000 },
+      headLines: 3,
+      tailLines: 10,
+    });
+    const lines = body.split("\n");
+    assert.deepEqual(lines.slice(0, 3), ["line-1", "line-2", "line-3"], "the head must be the command's first lines");
+    const marker = lines.find((line) => line.includes("omitted"));
+    assert.ok(marker?.startsWith("… 2987 lines"), `the marker counts the lines absent from the body: ${marker}`);
+    const blocks = body.split("\n\n");
+    assert.equal(blocks.at(-2), all.slice(-10).join("\n"), "the tail still comes from the end of the output");
+    assert.match(blocks.at(-1), /^\[Showing lines 2991-3000 of 3000\. Full output: .*bg001\.log\]$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("formatForModel only strips and collapses when pi did not truncate the result", async () => {

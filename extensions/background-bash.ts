@@ -14,7 +14,7 @@ import { type ChildExit, exitCodeFrom, JOB_EXIT_STDIO_GRACE_MS, waitForChildExit
 import { capBodyToPiWindow, formatLogFile, loadOutputFormatConfig, presentText } from "../lib/output-format.ts";
 import { piContext } from "./pi-context-utils.ts";
 
-const MAX_ACTIVE_JOBS = 10;
+const DEFAULT_MAX_ACTIVE_JOBS = 20;
 // pi's own truncation window (`truncate.ts`): completion bodies are capped the
 // same way pi caps a tool result, so the extension keeps no numbers of its own.
 const MAX_RESULT_LINES = DEFAULT_MAX_LINES;
@@ -118,6 +118,17 @@ type ActiveJob = {
 	logTruncated?: boolean;
 	/** The call crossed the threshold (or asked for `background: true`). */
 	promoted?: boolean;
+	/**
+	 * Promotion metadata. Set on the job (not only in the promotion-time write) so
+	 * the completion write — which rebuilds the record from this object — keeps
+	 * it, exactly as PLAN §6 requires. `promotionThresholdSeconds` is 0 for an
+	 * explicit `background: true`.
+	 */
+	promotedAt?: string;
+	promotedAfterSeconds?: number;
+	promotionThresholdSeconds?: number;
+	/** When `pbb kill` asked this job to stop; kept on the finished record. */
+	killRequestedAt?: string;
 	/** Something asked this job to stop: `pbb kill` or session shutdown. */
 	abortRequested?: boolean;
 	timeoutSeconds?: number;
@@ -159,6 +170,7 @@ type SessionState = {
 
 type BackgroundBashConfig = {
 	autoBackgroundAfterSeconds?: number;
+	maxActiveJobs?: number;
 	maxLogBytes?: number;
 };
 
@@ -203,10 +215,14 @@ function readConfigFile(path: string): BackgroundBashConfig {
 		if (!existsSync(path)) return {};
 		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
 		if (!parsed || typeof parsed !== "object") return {};
-		const raw = parsed as { autoBackgroundAfterSeconds?: unknown; maxLogBytes?: unknown };
+		const raw = parsed as { autoBackgroundAfterSeconds?: unknown; maxActiveJobs?: unknown; maxLogBytes?: unknown };
 		const config: BackgroundBashConfig = {};
 		if (typeof raw.autoBackgroundAfterSeconds === "number" && Number.isFinite(raw.autoBackgroundAfterSeconds)) {
 			config.autoBackgroundAfterSeconds = raw.autoBackgroundAfterSeconds;
+		}
+		// Only a positive, finite count is a cap; anything else keeps the default.
+		if (typeof raw.maxActiveJobs === "number" && Number.isFinite(raw.maxActiveJobs) && raw.maxActiveJobs > 0) {
+			config.maxActiveJobs = Math.floor(raw.maxActiveJobs);
 		}
 		// Only a positive, finite budget is a cap; anything else keeps the default.
 		if (typeof raw.maxLogBytes === "number" && Number.isFinite(raw.maxLogBytes) && raw.maxLogBytes > 0) {
@@ -226,6 +242,10 @@ function mergedConfig(cwd?: string): BackgroundBashConfig {
 
 function getAutoBackgroundAfterSeconds(cwd?: string): number {
 	return mergedConfig(cwd).autoBackgroundAfterSeconds ?? DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS;
+}
+
+function getMaxActiveJobs(cwd?: string): number {
+	return mergedConfig(cwd).maxActiveJobs ?? DEFAULT_MAX_ACTIVE_JOBS;
 }
 
 function getMaxLogBytes(cwd?: string): number {
@@ -636,6 +656,10 @@ function writePbbJob(job: ActiveJob, patch: Record<string, unknown> = {}): void 
 		pgid: job.pgid,
 		runner: job.runner,
 		killSignal: job.killSignal,
+		...(job.killRequestedAt === undefined ? {} : { killRequestedAt: job.killRequestedAt }),
+		...(job.promotedAt === undefined ? {} : { promotedAt: job.promotedAt }),
+		...(job.promotedAfterSeconds === undefined ? {} : { promotedAfterSeconds: job.promotedAfterSeconds }),
+		...(job.promotionThresholdSeconds === undefined ? {} : { promotionThresholdSeconds: job.promotionThresholdSeconds }),
 		logPath: job.logPath ?? join(pbbLogsDir(job.pbb), `${job.id}.log`),
 		...(job.logBytes === undefined ? {} : { logBytes: job.logBytes }),
 		// Only ever a real cap on this job's log — never a marker inside the file
@@ -716,8 +740,9 @@ function handlePbbKillRequestsForSession(session: SessionState): void {
 			}
 			if (request.type !== "kill" || request.jobId !== job.id) continue;
 			job.killSignal = normalizeSignal(request.signal);
+			job.killRequestedAt = new Date().toISOString();
 			appendPbbEvent(job, "job.kill_requested", { requestId: request.requestId, signal: job.killSignal });
-			writePbbJob(job, { status: "kill_requested", killRequestedAt: new Date().toISOString(), killSignal: job.killSignal, lastEventId: job.lastEventId });
+			writePbbJob(job, { status: "kill_requested", killSignal: job.killSignal, lastEventId: job.lastEventId });
 			job.abortRequested = true;
 			killProcessGroup(job.pgid ?? job.pid, job.killSignal);
 			rmSync(path, { force: true });
@@ -1889,18 +1914,20 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 
 	pi.registerTool({
 		...inner,
-		// Only the two claims that are true: a *truncated* result names its log, and a
-		// *backgrounded* job has an id `pbb` can read (PLAN §6). A small foreground
-		// result leaves no file, and a log that hit `maxLogBytes` is not the whole
-		// output — so neither "every command's output is on disk" nor "foreground
-		// calls are readable with pbb tail" belongs here.
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first); a truncated result names the log file that holds the command's output. Set background: true to run immediately in the background and get a job id (usable with pbb status/tail). Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background and gets such a job id; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
+		// Only the claims that are true: a *truncated* result names its log, a
+		// *backgrounded* job has an id `pbb` can read (PLAN §6), and what reaches the
+		// model for a truncated result is head + omitted marker + tail — the reshape
+		// `lib/output-format.ts` performs (COMPARISON.md decision 5). A small
+		// foreground result leaves no file, and a log that hit `maxLogBytes` is not
+		// the whole output — so neither "every command's output is on disk" nor
+		// "foreground calls are readable with pbb tail" belongs here.
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first) reaches you as its first few and last few lines with a "… N lines omitted …" marker between them (N counts the lines not shown); a truncated result names the log file that holds the command's output. Set background: true to run immediately in the background and get a job id (usable with pbb status/tail). Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background and gets such a job id; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
 		promptSnippet: `Execute bash commands (ls, grep, find, etc.); timeout is in seconds. Set background: true for long-running non-interactive commands. Commands still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background and wake you with a pi-background-bash result when finished.`,
 		promptGuidelines: [
 			"Use bash with background: true for long-running non-interactive commands such as builds, full test suites, dev servers, watchers, deploys, downloads, or commands you do not need before the next step.",
 			`Use bash normally for shell commands; Pi automatically moves bash commands that run longer than the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) to the background.`,
 			"When bash reports that a command started or moved to background, do not retry it just to wait; continue independent work or tell the user the job is running.",
-			"Use the pbb CLI (`pbb list`, `pbb status <job>`, `pbb tail <job>`) only when you need progress before the completion follow-up arrives, need full truncated logs, or need to manage a job; pbb is on PATH inside bash commands and defaults to the current instance (use `--scope session` for sibling sessions' jobs).",
+			"Use the pbb CLI (`pbb list`, `pbb status <job>`, `pbb tail <job>`) only when you need progress before the completion follow-up arrives, need full truncated logs, or need to manage a job; pbb is on PATH inside bash commands and defaults to this session + this instance of it. Other instances of this session need `--scope session`; other sessions (sibling sessions, subagents) need `--scope all` / `--all`.",
 			"When a <pi_context source=\"pi-background-bash\" kind=\"background_bash_result\"> message appears, treat it like the final result of the original bash command.",
 			"A <pi_context source=\"pi-background-bash\" kind=\"background_bash_digest\"> message lists background completions that were recorded while no live session could receive them; treat every entry as a final result (an entry with outcome=lost has an unknown outcome — inspect its log instead of assuming success).",
 			"Do not use bash for interactive commands that require stdin unless the user explicitly asks for that behavior.",
@@ -1929,13 +1956,14 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
 			const cwd = ctx?.cwd ?? process.cwd();
 			const autoAfterSeconds = getAutoBackgroundAfterSeconds(cwd);
+			const maxActiveJobs = getMaxActiveJobs(cwd);
 			const maxLogBytes = getMaxLogBytes(cwd);
 			const immediate = params.background === true;
 
 			if (signal?.aborted) throw new Error("Command aborted");
-			if (session.activeJobs.size >= MAX_ACTIVE_JOBS) {
+			if (session.activeJobs.size >= maxActiveJobs) {
 				throw new Error(
-					`Too many bash jobs running (${session.activeJobs.size}/${MAX_ACTIVE_JOBS}). Wait for one to finish before starting another.`,
+					`Too many bash jobs running (${session.activeJobs.size}/${maxActiveJobs}). Finish one, or free a slot with \`pbb kill <jobid>\` (\`pbb list\` shows the running jobs; maxActiveJobs is configurable), before starting another.`,
 				);
 			}
 
@@ -1964,11 +1992,12 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 			const onPromote = (elapsedMs: number, log: LogStats) => {
 				job.logBytes = log.bytes;
 				job.logTruncated = log.truncated;
-				recordPbbJobStarted(job, cwd, {
-					promotedAt: new Date().toISOString(),
-					promotedAfterSeconds: Math.round(elapsedMs / 100) / 10,
-					promotionThresholdSeconds: immediate ? 0 : autoAfterSeconds,
-				});
+				// Recorded on the job, not just in this one write: the completion write
+				// rebuilds the record from `job`, and PLAN §6 keeps these fields.
+				job.promotedAt = new Date().toISOString();
+				job.promotedAfterSeconds = Math.round(elapsedMs / 100) / 10;
+				job.promotionThresholdSeconds = immediate ? 0 : autoAfterSeconds;
+				recordPbbJobStarted(job, cwd);
 				session.pending.start({
 					id: job.id,
 					text: job.command,
