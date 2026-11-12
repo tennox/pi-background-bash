@@ -279,3 +279,14 @@ Recommendation unchanged in direction, now with less risk attached: **B′**.
    fixed). Consequence: the head+tail change is a pi-core patch/PR; until it lands, the
    extension shows core's current (tail-only) truncation. The context guard (trimming
    oversized *historical* tool results on replay) stays, since it is not output formatting.
+7. **Never pretend to be an interactive terminal.** Agent reliability beats manu's viewing
+   comfort. So: no PTY by default, no `FORCE_COLOR`/`CLICOLOR_FORCE`, and spawned commands
+   get an explicitly dumb terminal (`TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`,
+   `GIT_PAGER=cat`) so nothing tries capability tricks, pagers cannot hang a turn, and
+   logs stay plain grep-able text. `\r` frames and ANSI/control sequences are collapsed /
+   stripped on the model-facing side only (defensively — some tools emit them regardless);
+   logs stay raw.
+   `tput` note: `tput` emits terminfo sequences without needing a TTY, so the risk isn't
+   "tput needs a TTY" but programs that *query* the terminal and wait for a reply; with
+   `TERM=dumb` that whole class is inert. A PTY stays a possible explicit per-call opt-in
+   and is otherwise out of scope.
