@@ -270,3 +270,12 @@ Recommendation unchanged in direction, now with less risk attached: **B′**.
 5. **Truncation shows head *and* tail** (e.g. first 3 + last 10 lines) with an explicit
    "N lines omitted" marker plus the full-output path, and the tool description says so —
    so the model knows it does not need to sleep/poll/tail on its own.
+6. **Truncation policy is pi's, not the extension's** — same argument as ANSI: it must be
+   identical for foreground and background output, so the *policy* (head+tail with an
+   omitted-lines marker, and the full-output path) belongs in pi core's bash tool. The
+   extension keeps **no** truncation numbers of its own: foreground results are core's, and
+   completion bodies reuse core's truncation (so the earlier "4 KiB completion cap" idea is
+   dropped — a different cap for completions would reproduce the very inconsistency being
+   fixed). Consequence: the head+tail change is a pi-core patch/PR; until it lands, the
+   extension shows core's current (tail-only) truncation. The context guard (trimming
+   oversized *historical* tool results on replay) stays, since it is not output formatting.
