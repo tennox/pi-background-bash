@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -396,7 +396,7 @@ test("bash background true reports timeouts and omits exit_code", async () => {
   }
 });
 
-test("auto-background records only post-background output in pbb log while final result stays complete", async () => {
+test("the job log carries the output from before AND after the promotion", async () => {
   const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 0.2 });
   const pbbRoot = join(cwd, "pbb");
   const env = {
@@ -423,7 +423,14 @@ test("auto-background records only post-background output in pbb log while final
     const jobPath = join(pbbRoot, "sessions", "session-key-auto-log-test", "instances", "instance-auto-log-test", "jobs", "bg001.json");
     const logPath = join(pbbRoot, "sessions", "session-key-auto-log-test", "instances", "instance-auto-log-test", "logs", "bg001.log");
     await waitForCondition(() => existsSync(logPath) && readFileSync(logPath, "utf8").includes("after-threshold"));
-    assert.match(readFileSync(logPath, "utf8"), /after-threshold/);
+    // Write-through starts at spawn, so the log is the whole command output — not
+    // only what arrived after the threshold (Decision 2: a real file from t0).
+    const log = readFileSync(logPath, "utf8");
+    assert.match(log, /before-threshold/);
+    assert.match(log, /after-threshold/);
+    // ... and it stays raw: no status line, no job-id marker.
+    assert.doesNotMatch(log, /Command exited/);
+    assert.doesNotMatch(log, /\[pbb:/);
     const job = JSON.parse(readFileSync(jobPath, "utf8"));
     assert.equal(job.jobId, "bg001");
     assert.equal(job.runner, "pbb");
@@ -654,12 +661,17 @@ test("pbb kill requests abort a live current-instance background job", async () 
     PI_LANE_CURRENT_LANE: "main",
   };
 
+  // The completion message is written to the session transcript as soon as it is
+  // sent, so the transcript is a stable place to read it from (a provider request
+  // only exists while a turn is running).
+  const sessionFile = join(dir, "session.jsonl");
+  writeFileSync(sessionFile, "");
   const mock = await createBgMock(script(
     bg(`sleep 5; echo survived > ${JSON.stringify(marker)}`),
     sh(`node ${JSON.stringify(PBB_CLI)} kill bg001`),
     text("requested kill"),
     text("saw aborted result"),
-  ), { env });
+  ), { env, sessionFile });
 
   try {
     const events = await mock.run("start and kill a background command", TIMEOUT);
@@ -667,7 +679,15 @@ test("pbb kill requests abort a live current-instance background job", async () 
     const jobPath = join(pbbRoot, "sessions", "session-key-pbb-kill-test", "instances", "instance-pbb-kill-test", "jobs", "bg001.json");
     const logPath = join(pbbRoot, "sessions", "session-key-pbb-kill-test", "instances", "instance-pbb-kill-test", "logs", "bg001.log");
     await waitForCondition(() => existsSync(jobPath) && JSON.parse(readFileSync(jobPath, "utf8")).outcome === "abort");
-    assert.match(readFileSync(logPath, "utf8"), /Command aborted/);
+    // The log stays raw command output (Decision 9): the status line lives in the
+    // completion message, never in the file `pbb tail` shows.
+    assert.doesNotMatch(readFileSync(logPath, "utf8"), /Command aborted/);
+    const completion = await waitForCondition(
+      () => readSessionEntries(sessionFile).find((entry) => entry.type === "custom_message" && entry.details?.jobId === "bg001"),
+      TIMEOUT,
+    );
+    assert.match(completion.content, /outcome="abort"/);
+    assert.match(completion.content, /Command aborted/);
     assert.equal(existsSync(marker), false);
   } finally {
     await mock.close();
@@ -1527,6 +1547,178 @@ test("reconcile does not re-deliver a completion the transcript already carries"
       const job = JSON.parse(readFileSync(join(jobsDir, "bg004.json"), "utf8"));
       assert.equal(job.delivered, true);
       assert.equal(job.deliveredReason, "already_in_session_history");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The exec seam: promotion and the foreground full-output path
+//
+// These drive the registered tool directly through a fake session, so the tool
+// call's own timing and its `details`/`structuredContent` are observable —
+// pi-mock only sees the model-facing text.
+// ---------------------------------------------------------------------------
+
+function configuredCwd(seconds) {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-seam-${process.pid}-${Date.now()}-`));
+  mkdirSync(join(dir, ".pi"), { recursive: true });
+  writeFileSync(join(dir, ".pi", "background-bash.json"), JSON.stringify({ autoBackgroundAfterSeconds: seconds }));
+  return dir;
+}
+
+function logFiles(root) {
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { recursive: true })
+    .map((entry) => String(entry))
+    .filter((entry) => entry.endsWith(".log"))
+    .map((entry) => entry.split("/").pop())
+    .sort();
+}
+
+function resultText(result) {
+  return result.content.map((part) => (typeof part.text === "string" ? part.text : "")).join("\n");
+}
+
+test("promotion answers just after the threshold and the same job id reaches result, job file and completion", async () => {
+  const dir = configuredCwd(0.3);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "promote-session", sessionFile: join(dir, "promote.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+
+      const startedAt = Date.now();
+      const result = await session.bash().execute(
+        "call-promote",
+        { command: "echo pre-promotion; sleep 1.5; echo post-promotion" },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      const elapsed = Date.now() - startedAt;
+
+      // 0.3 s threshold: answering much earlier would mean the call never really
+      // ran; answering much later would mean the promotion path stalls the turn.
+      assert.ok(elapsed >= 250, `promotion answered before the threshold (${elapsed} ms)`);
+      assert.ok(elapsed < 1300, `promotion answered ${elapsed} ms into a 300 ms threshold`);
+
+      const text = resultText(result);
+      assert.match(text, /Bash job bg001 moved to background after 0\.3s\./);
+      const details = result.details;
+      assert.equal(details.jobId, "bg001");
+      assert.equal(details.outcome, "running");
+      // Honest structured content: the job is running, so there is no exit code,
+      // and the full-output path is the job log (not pi's temp file).
+      assert.equal(result.structuredContent.job_id, "bg001");
+      assert.equal(result.structuredContent.exit_code, undefined);
+      assert.match(String(result.structuredContent.full_output_path), /bg001\.log$/);
+      // Flush before resolve: what the command wrote before the threshold is in
+      // the answer's structured output, not lost at promotion.
+      assert.match(String(result.structuredContent.output), /pre-promotion/);
+
+      const jobPath = join(root, "sessions", details.sessionKey, "instances", details.instanceId, "jobs", "bg001.json");
+      await waitForCondition(() => existsSync(jobPath), 5_000);
+      const runningJob = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(runningJob.jobId, "bg001");
+      assert.equal(runningJob.status, "running");
+      assert.equal(runningJob.promotionThresholdSeconds, 0.3);
+      assert.match(String(runningJob.promotedAt), /^\d{4}-\d{2}-\d{2}T/);
+
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+      const completion = session.messages.at(-1).message;
+      assert.match(completion.content, /id="bg001"/);
+      assert.equal(completion.details.jobId, "bg001");
+      assert.match(completion.content, /post-promotion/);
+
+      const finishedJob = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(finishedJob.outcome, "exit");
+      assert.equal(finishedJob.exitCode, 0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a promoted job is not killed by the run's abort signal", async () => {
+  // `signal` is ONE AbortController per run, handed unchanged to every tool call
+  // (agent.ts / agent-loop.ts). Leaving our listener attached would SIGTERM a job
+  // the model was just told is running, on the next turn's abort.
+  const dir = configuredCwd(0.2);
+  const root = join(dir, "pbb");
+  const marker = join(dir, "promoted-job-survived");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "abort-promoted-session", sessionFile: join(dir, "abort.jsonl") });
+  const controller = new AbortController();
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+
+      const result = await session.bash().execute(
+        "call-abort-after-promote",
+        { command: `sleep 1; echo survived > ${JSON.stringify(marker)}` },
+        controller.signal,
+        undefined,
+        session.ctx,
+      );
+      const details = result.details;
+      assert.equal(details.outcome, "running", "the call must have been promoted");
+
+      controller.abort();
+
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+      const completion = session.messages.at(-1).message;
+      assert.equal(completion.details.outcome, "exit");
+      assert.equal(completion.details.exitCode, 0);
+      await waitForCondition(() => existsSync(marker), 5_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a truncated foreground result names its job log, which holds the whole output", async () => {
+  const dir = configuredCwd(30);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "foreground-full-output", sessionFile: join(dir, "fg.jsonl") });
+  // 3000 lines is past pi's 2000-line window, so pi truncates and spills the rest
+  // to its own temp file — which this layer replaces with the job log.
+  const command =
+    "awk 'BEGIN { for (i = 0; i < 3000; i++) printf \"VERBOSE_%05d %s\\n\", i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" }'";
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+
+      const result = await session.bash().execute("call-verbose", { command }, undefined, undefined, session.ctx);
+      const text = resultText(result);
+      assert.match(text, /Showing lines \d+-\d+ of 3000/);
+      assert.match(text, /Full output: \/.*bg001\.log\]/);
+      assert.doesNotMatch(text, /pi-bash/, "pi's temp file must not be named any more");
+
+      const fullOutputPath = result.details?.fullOutputPath;
+      assert.equal(typeof fullOutputPath, "string");
+      assert.match(fullOutputPath, /\/logs\/bg001\.log$/);
+      assert.equal(result.structuredContent.full_output_path, fullOutputPath);
+      // The file the model is pointed at really holds the whole output, head included.
+      const full = readFileSync(fullOutputPath, "utf8");
+      assert.match(full, /VERBOSE_00000/);
+      assert.match(full, /VERBOSE_02999/);
+
+      // A foreground call that was neither truncated nor promoted leaves no log.
+      const logsBefore = logFiles(root);
+      assert.deepEqual(logsBefore, ["bg001.log"]);
+      const small = await session.bash().execute("call-small", { command: "echo tiny" }, undefined, undefined, session.ctx);
+      assert.equal(small.details?.fullOutputPath, undefined);
+      assert.deepEqual(logFiles(root), ["bg001.log"], "an untruncated foreground call deletes its log");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
