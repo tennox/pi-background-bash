@@ -183,3 +183,23 @@ test("exec feeds raw Buffers to onData and writes the same bytes to the log", as
 		harness.cleanup();
 	}
 });
+
+test("exec does not hang on a descendant that inherited stdout", async () => {
+	// pi's `waitForChildProcess` resolves on `exit` plus an idle grace re-armed on
+	// every chunk (earendil-works/pi#5303); a backgrounded grandchild that keeps
+	// the pipes open must not hold the turn.
+	const { extension } = await loadModules();
+	const harness = createSeam(extension);
+	try {
+		const started = Date.now();
+		const result = await harness.seam.exec("sleep 3 & echo inherited-pipe", process.cwd(), {
+			onData: harness.onData,
+		});
+		const elapsed = Date.now() - started;
+		assert.equal(result.exitCode, 0);
+		assert.ok(elapsed < 2500, `exec waited ${elapsed} ms for a descendant holding the pipes`);
+		assert.match(readFileSync(harness.logPath, "utf8"), /inherited-pipe/);
+	} finally {
+		harness.cleanup();
+	}
+});
