@@ -290,3 +290,18 @@ Recommendation unchanged in direction, now with less risk attached: **B′**.
    "tput needs a TTY" but programs that *query* the terminal and wait for a reply; with
    `TERM=dumb` that whole class is inert. A PTY stays a possible explicit per-call opt-in
    and is otherwise out of scope.
+8. **No upstreaming.** pi's maintainers built their defaults deliberately; our confidence is
+   not high enough to tell them otherwise. Everything below stays local. Consequence:
+   prefer pi's behaviour wherever we are merely opinionated.
+9. **Supersedes 7's env overrides: no `TERM=dumb`, no `NO_COLOR`, no `PAGER` overrides.**
+   pi spawns bash with its own `getShellEnv()` and does not touch `TERM`; manu has never
+   seen a CLI block on a prompt inside a pi bash call, so the hang hazard was theoretical.
+   Deviating there costs real risk (tools behaving differently under `TERM=dumb`) for a
+   benefit the presentation layer already delivers. Spawn env = pi's env + our per-spawn
+   identity vars, nothing else.
+   Remaining deviations are **presentation-only** and cannot change a command's behaviour:
+   collapse `\r` frames to the last frame, strip ANSI/control sequences from what the model
+   reads, and head+tail truncation with the full-output path. Logs stay raw.
+   (Note pi itself ships `stripAnsi`/`sanitizeBinaryOutput` and applies them to `!` commands
+   — the tooling and the judgement exist in core; we are only choosing which surface to
+   apply it to.)
