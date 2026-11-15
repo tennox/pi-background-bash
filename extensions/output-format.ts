@@ -110,10 +110,6 @@ function truncationFacts(value: unknown): TruncationFacts | undefined {
 	return facts;
 }
 
-function escapeClosingTags(text: string): string {
-	return text.replace(/<\/pi_context>/gi, "<\\/pi_context>");
-}
-
 /**
  * The size guard for a *historical* result that carries no full-output path and
  * for any non-bash tool result pi left oversized. It never invents a path: the
@@ -131,7 +127,9 @@ function trimOversized(text: string, config: OutputFormatConfig): string {
 	if (!truncation?.truncated) return text;
 	const notice = formatTruncationNotice(truncation, "tail");
 	const withHint = notice.endsWith("]") ? `${notice.slice(0, -1)} — ${TRIMMED_NOTICE}]` : `${notice} ${TRIMMED_NOTICE}`;
-	return `${escapeClosingTags(content)}\n\n${withHint}`;
+	// No envelope escaping: message content is plain text now, so command output
+	// passes through exactly as it was written.
+	return `${content}\n\n${withHint}`;
 }
 
 /**

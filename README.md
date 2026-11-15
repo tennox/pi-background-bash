@@ -18,13 +18,13 @@ A completion is never dropped silently. Four mechanisms keep that true:
 - **Per-session ownership.** pi caches the extension factory per cwd, so one loaded module serves every session in a pi process. Job tracking, shutdown state, and the pending-jobs widget are per session; a sibling session's `/new`, `/resume`, `/reload` or quit kills only *its own* jobs. A finishing subagent kills nothing: pi-subagents tears child sessions down with `AgentSession.dispose()`, which never emits `session_shutdown`, so no shutdown hook runs for them — their leftover state is pruned by liveness (a `WeakRef` on the session manager), never by a shutdown kill.
 - **Never-drop finalization.** The job file is finalized with the real outcome *before* any delivery attempt. If the session is shutting down (or `sendMessage` throws), the file records `delivered: false` plus a `droppedReason` instead of staying at `status: "running"`.
 - **`exit` + idle grace.** A detached descendant that inherits stdout/stderr keeps Node's `close` from ever firing, so completion waits for the child's `exit` plus an idle grace that is re-armed on every output chunk (same approach as pi core's `waitForChildProcess`, earendil-works/pi#5303). A verbose descendant cannot truncate the tail; a silent one releases completion after the grace.
-- **Reconcile digest.** On every `session_start`, undelivered completions recorded for *this* session are re-delivered as a single coalesced message (`kind="background_bash_digest"`), and stuck `status: "running"` jobs whose owner process is gone are finalized as `outcome: "lost"` — never fabricated as an exit. Jobs older than 24h are not re-delivered (they are marked with a reason), and at most 20 entries go into one digest; the rest are deferred to the next session start.
+- **Reconcile digest.** On every `session_start`, undelivered completions recorded for *this* session are re-delivered as a single coalesced plain-text digest message (`details.digest` marks it), and stuck `status: "running"` jobs whose owner process is gone are finalized as `outcome: "lost"` — never fabricated as an exit. Jobs older than 24h are not re-delivered (they are marked with a reason), and at most 20 entries go into one digest; the rest are deferred to the next session start.
 
 ## Fork notice
 
 This is a **maintained fork** of [`sshkeda/pi-background-bash`](https://github.com/sshkeda/pi-background-bash) with two fixes:
 
-1. **Installable out of the box.** The upstream package depends on the private repository `github:sshkeda/pi-context` (returns 404), so `pi install` fails for everyone. The three functions it uses (`piContext`, `truncateContextText`, `formatTruncationNotice`) are now inlined in [`extensions/pi-context-utils.ts`](extensions/pi-context-utils.ts) and the dependency is removed.
+1. **Installable out of the box.** The upstream package depends on the private repository `github:sshkeda/pi-context` (returns 404), so `pi install` fails for everyone. The truncation helpers it still provides are inlined in [`extensions/pi-context-utils.ts`](extensions/pi-context-utils.ts) and the dependency is removed; background completions themselves are plain text with structured `details`, so the XML result envelope needed no replacement at all.
 2. **No stale-ctx crashes.** The background-completion callbacks evaluated `ctx.cwd` lazily, after session teardown in headless one-shot mode, throwing `This extension ctx is stale after session replacement or reload`. `cwd` is now captured eagerly at job start.
 
 Verified end-to-end (interactive + headless): `background: true`, automatic backgrounding after the configured threshold, detached pbb runner with full logs, follow-up injection into the session (`custom_message` entry with `kind="background_bash_result"`), and agent wake-up via `triggerTurn`.
@@ -88,12 +88,14 @@ Add a timeout if you want Pi to kill the command after a fixed number of seconds
 bash({ command: "npm test", background: true, timeout: 120 })
 ```
 
-Completion results arrive as Pi context messages:
+Completion results arrive as plain-text Pi messages (the job id, outcome, duration and the full-output pointer live in the text, with the same facts in structured `details` beside it):
 
-```xml
-<pi_context source="pi-background-bash" kind="background_bash_result" id="bg001" outcome="exit" exit_code="0">
-...
-</pi_context>
+```text
+Bash job bg001 finished after 2.0s (exit code 0).
+
+all tests passed
+
+[Showing lines 91-100 of 1000. Full output: pbb tail bg001 --full]
 ```
 
 Commands run through the PBB-owned bash runner (`bash -lc`) so background jobs have recorded `pid`/`pgid` and can be killed as process groups. Verbose completion messages are truncated in-session with a `pbb tail <job> --full` hint; the full output is kept in the PBB log. See [`docs/pbb-runner.md`](docs/pbb-runner.md) for the v1 runner contract.
@@ -116,7 +118,7 @@ pbb tail bg001 -n 80
 pbb kill bg001
 ```
 
-`pbb` is designed for agents: output is wrapped in compact `pi_context` envelopes and always includes session/instance identity. Local job IDs are fixed-width strings such as `bg001`, `bg002`, and `bg010` so listings sort chronologically. `pbb` uses [`pi-lane`](https://github.com/sshkeda/pi-lane) runtime identity env vars (`PI_LANE_SESSION_KEY`, `PI_LANE_INSTANCE_ID`, etc.) and defaults to the current live Pi instance, not every terminal attached to the same session.
+`pbb` is designed for agents: it reads cleanly in a shell and always includes session/instance identity (its results carry a machine-readable XML-ish header line, and `--json` gives pure JSON for scripts). The *completions the extension delivers into the session* are plain text without any envelope. Local job IDs are fixed-width strings such as `bg001`, `bg002`, and `bg010` so listings sort chronologically. `pbb` uses [`pi-lane`](https://github.com/sshkeda/pi-lane) runtime identity env vars and defaults to the current live Pi instance, not every terminal attached to the same session.
 
 ### Scope: this session + this instance by default
 
@@ -202,7 +204,7 @@ You can also override the threshold for a single project with `.pi/background-ba
 | key | default | meaning |
 | --- | --- | --- |
 | `autoBackgroundAfterSeconds` | `30` | move a still-running call to the background; `0` disables automatic backgrounding (`background: true` still works) |
-| `maxActiveJobs` | `20` | how many jobs one session may run at once. A call past the cap is refused with a message naming `pbb kill <jobid>`, so a slot can be freed without waiting for the job to end |
+| `maxActiveJobs` | `10` | how many jobs one session may run at once. A call past the cap is refused with a message naming `pbb kill <jobid>`, so a slot can be freed without waiting for the job to end |
 | `maxLogBytes` | `104857600` (100 MB) | size cap per job log. Appending stops at the cap; the job file records `logTruncated: true` + `logBytes`, and the completion message, `pbb status` and `pbb tail` say the log is capped. Nothing is written into the log itself. |
 
 Output formatting has its own config file, `~/.pi/bash-output.json`, with a per-project override in
@@ -226,7 +228,10 @@ The extension updates the `bash` tool metadata exposed to models:
 - the tool description documents automatic backgrounding
 - prompt snippets/guidelines teach the agent not to retry just to wait
 - prompt guidelines teach the agent to use `pbb list/status/tail` for inspection
-- background completion messages are described as final bash results
+- prompt guidelines and the description disclose that a job's full output is kept in its
+  log file for 7 days (and never while a job runs or its completion is undelivered)
+- background completion/digest messages are described as final bash results and arrive as
+  plain text with structured `details` (job id, command, outcome, duration)
 
 No global Pi prompt patch is required.
 

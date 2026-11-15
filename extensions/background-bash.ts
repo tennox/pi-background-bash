@@ -12,9 +12,10 @@ import { createPiPending, type PiPendingRegistry } from "pi-pending";
 import { type TObject, Type } from "typebox";
 import { type ChildExit, exitCodeFrom, JOB_EXIT_STDIO_GRACE_MS, waitForChildExit } from "../lib/child-exit.ts";
 import { capBodyToPiWindow, formatLogFile, loadOutputFormatConfig, presentText } from "../lib/output-format.ts";
-import { piContext } from "./pi-context-utils.ts";
 
-const DEFAULT_MAX_ACTIVE_JOBS = 20;
+// manu, 2026-11-11: "10 is good for now". Stays configurable; a project can
+// still override it with `.pi/background-bash.json`.
+const DEFAULT_MAX_ACTIVE_JOBS = 10;
 // pi's own truncation window (`truncate.ts`): completion bodies are capped the
 // same way pi caps a tool result, so the extension keeps no numbers of its own.
 const MAX_RESULT_LINES = DEFAULT_MAX_LINES;
@@ -1125,10 +1126,6 @@ export function createBashExec(options: BashExecOptions): BashExec {
 }
 
 
-function escapePiContextClosingTags(text: string): string {
-	return text.replace(/<\/pi_context>/gi, "<\\/pi_context>");
-}
-
 /** Where a call's full output lives. Job calls: the instance log dir. */
 function logPathFor(job: ActiveJob): string {
 	return job.pbb ? join(pbbLogsDir(job.pbb), `${job.id}.log`) : join(pbbRoot(), "logs", `${job.id}.log`);
@@ -1202,29 +1199,29 @@ function promotedToolResult(
 	} as unknown as AgentToolResult<BackgroundBashDetails>;
 }
 
-function buildXmlResult(job: ActiveJob, outcome: Outcome, exitCode: number | null, durationMs: number, body: string): string {
-	// pi-context emits payload text as-is; escape the outer wrapper close tag so
-	// command output cannot prematurely close the XML-ish context envelope.
-	return piContext({
-		source: "pi-background-bash",
-		kind: "background_bash_result",
-		id: job.id,
-		attrs: {
-			tool_call_id: job.toolCallId,
-			session_id: job.pbb?.sessionId,
-			session_key: job.pbb?.sessionKey,
-			instance_id: job.pbb?.instanceId,
-			lane: job.pbb?.lane,
-			global_job_id: job.pbb ? `${job.pbb.instanceId}:${job.id}` : undefined,
-			pbb_cursor: job.lastEventId,
-			started_at: new Date(job.startedAt).toISOString(),
-			command: job.command,
-			outcome,
-			exit_code: exitCode,
-			duration_ms: durationMs,
-		},
-		body: escapePiContextClosingTags(body),
-	});
+/**
+ * The completion message: plain text, pi's own convention for tool results.
+ * The facts the old wrapper envelope carried as attributes now live in the text
+ * header (job id, outcome wording, exit code where one exists, duration) and in
+ * `details` (job id, command, timestamps, session/instance identity, …); the
+ * body is the trimmed log window, which carries the `Full output: …` footer or
+ * the log-cap note itself. No envelope around any of it — and no escaping:
+ * command output is passed through as it was written.
+ */
+function buildPlainResult(job: ActiveJob, result: JobResult, durationMs: number, body: string): string {
+	// An exit code is only named where one honestly exists: a timed-out, aborted
+	// or failed job has none (`details.exitCode` is null for the same reason).
+	const state =
+		result.outcome === "timeout"
+			? "timed out"
+			: result.outcome === "abort"
+				? "aborted"
+				: result.outcome === "error"
+					? "failed"
+					: result.exitCode === null
+						? "finished with no exit code"
+						: `exit code ${result.exitCode}`;
+	return `Bash job ${job.id} finished after ${formatDuration(durationMs)} (${state}).\n\n${body}`;
 }
 
 function sendBackgroundResultFollowUp(session: SessionState, job: ActiveJob, content: string, details: BackgroundBashDetails): void {
@@ -1280,7 +1277,7 @@ function finishBackgroundJob(session: SessionState, job: ActiveJob, result: JobR
 	// log is the canonical output and is still the only thing that survives a
 	// `/reload` (PLAN §6).
 	const body = completionBodyFromLog(job, result);
-	const content = buildXmlResult(job, result.outcome, result.exitCode, durationMs, body);
+	const content = buildPlainResult(job, result, durationMs, body);
 	const details: BackgroundBashDetails = {
 		jobId: job.id,
 		command: job.command,
@@ -1363,14 +1360,17 @@ function jobIdsSeenInSession(ctx: RepairableSessionContext): Set<string> {
 		// delivered and defeat the whole sweep.
 		if (record?.type !== "custom_message" || record.customType !== CUSTOM_TYPE) continue;
 		const details = asRecord(record.details);
+		// The job id comes from the structured `details` — never from the message
+		// content, which is plain text now (and stays unattributed for legacy
+		// envelope-era records): for anything the details cannot name, the sweep
+		// falls back to the job file's own `delivered` mark instead of re-parsing
+		// completion bodies.
 		if (!details?.digest && typeof details?.jobId === "string") ids.add(details.jobId);
 		const digestJobs = Array.isArray(details?.digestJobs) ? details.digestJobs : [];
 		for (const item of digestJobs) {
 			const jobId = asRecord(item)?.jobId;
 			if (typeof jobId === "string") ids.add(jobId);
 		}
-		const content = typeof record?.content === "string" ? record.content : undefined;
-		for (const match of content?.matchAll(/<pi_context\b[^>]*\bid="(bg\d{3,})"/g) ?? []) ids.add(match[1]);
 	}
 	return ids;
 }
@@ -1502,27 +1502,20 @@ function sendCompletionDigest(session: SessionState, entries: ReconcileEntry[], 
 	if (entries.length === 0) return;
 	const listed = entries.map(formatDigestEntry).join("\n\n");
 	const body = deferred > 0 ? `${listed}\n\n+${deferred} more recorded completion${deferred === 1 ? "" : "s"} deferred to the next session start (pbb list --scope session shows them).` : listed;
-	const content = piContext({
-		source: "pi-background-bash",
-		kind: "background_bash_digest",
-		attrs: {
-			session_id: session.identity?.sessionId,
-			session_key: session.identity?.sessionKey,
-			instance_id: session.identity?.instanceId,
-			jobs: entries.length,
-			deferred: deferred > 0 ? deferred : undefined,
+	// Plain text, like every completion (the wrapper envelope is retired). The
+	// per-entry lines keep their `[jobId] outcome=…` wording inside `body`.
+	const header = `Bash job digest — ${entries.length} background completion${entries.length === 1 ? "" : "s"} recorded while no live session could receive them, re-delivered at startup.`;
+	const content = `${header}\n\n${capBodyToPiWindow(
+		presentText(body),
+		// Presentation is part of the formatting layer (PLAN §7a): a digest body
+		// carries raw log tails, so it gets the same presentation pass and pi's
+		// window as a completion body — never a raw `ESC]0;…` title sequence.
+		{
+			maxLines: MAX_RESULT_LINES,
+			maxBytes: MAX_RESULT_BYTES,
+			fullOutputPath: "pbb tail <job> --scope session --full",
 		},
-		body: escapePiContextClosingTags(
-			// Presentation is part of the formatting layer (PLAN §7a): a digest body
-			// carries raw log tails, so it gets the same escape/CR pass and pi's window
-			// as a completion body — never a raw `ESC]0;…` title sequence.
-			capBodyToPiWindow(presentText(body), {
-				maxLines: MAX_RESULT_LINES,
-				maxBytes: MAX_RESULT_BYTES,
-				fullOutputPath: "pbb tail <job> --scope session --full",
-			}),
-		),
-	});
+	)}`;
 	const summaries: DigestJobSummary[] = entries.map((entry) => ({
 		jobId: String(entry.job.jobId),
 		instanceId: typeof entry.job.instanceId === "string" ? entry.job.instanceId : undefined,
@@ -1807,17 +1800,20 @@ function maxJobNumberSeen(id: PbbIdentity): number {
 	return Math.max(maxJobNumberOnDisk(pbbJobsDir(id)), maxJobNumberOnDisk(pbbLogsDir(id), ".log"));
 }
 
-function sessionJobNumberFloor(ctx: RepairableSessionContext): number {
-	let max = 0;
+/**
+ * The highest job number any transcript record of this session names, plus the
+ * on-disk fallback (the job files and logs). Records that carry no structured
+ * id — legacy completion messages from the envelope era among them — cannot
+ * name one from their content (never regex it back out), so the disk decides
+ * for them: `maxJobNumberSeen` reads every job file and log name in scope.
+ */
+function sessionJobNumberFloor(ctx: RepairableSessionContext, id?: PbbIdentity): number {
+	let max = id ? maxJobNumberSeen(id) : 0;
 	const entries = ctx.sessionManager?.getEntries?.() ?? [];
 	for (const entry of entries as Array<Record<string, unknown>>) {
 		const details = asRecord(entry.details);
-		const content = typeof entry.content === "string" ? entry.content : undefined;
-		const candidates = [details?.jobId, content?.match(/<pi_context\b[^>]*\bid="(bg\d{3,})"/)?.[1]];
-		for (const candidate of candidates) {
-			const n = parseJobNumber(candidate);
-			if (n !== undefined) max = Math.max(max, n);
-		}
+		const n = parseJobNumber(details?.jobId);
+		if (n !== undefined) max = Math.max(max, n);
 	}
 	return max;
 }
@@ -1875,8 +1871,8 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		session.identity = pbbIdentity(ctx, session.id);
 		session.jobNumberFloor = Math.max(
 			session.jobNumberFloor,
-			sessionJobNumberFloor(ctx),
-			session.identity ? maxJobNumberSeen(session.identity) : 0,
+		// Structured transcript ids plus the job-file fallback (see the reader).
+			sessionJobNumberFloor(ctx, session.identity),
 		);
 		pruneDeadSessions(session);
 		try {
@@ -1921,15 +1917,16 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		// foreground result leaves no file, and a log that hit `maxLogBytes` is not
 		// the whole output — so neither "every command's output is on disk" nor
 		// "foreground calls are readable with pbb tail" belongs here.
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first) reaches you as its first few and last few lines with a "… N lines omitted …" marker between them (N counts the lines not shown); a truncated result names the log file that holds the command's output. Set background: true to run immediately in the background and get a job id (usable with pbb status/tail). Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background and gets such a job id; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first) reaches you as its first few and last few lines with a "… N lines omitted …" marker between them (N counts the lines not shown); a truncated result names the log file that holds the command's output. Set background: true to run immediately in the background and get a job id (usable with pbb status/tail). Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background and gets such a job id; a plain-text result message is injected when it finishes, carrying the job id, outcome, duration, the trimmed output and the full-output pointer. Full output lives in the named log file for 7 days (afterwards only what your transcript retains survives); a log is never deleted while its job is running or before its completion is delivered. Optionally provide a timeout in seconds.`,
 		promptSnippet: `Execute bash commands (ls, grep, find, etc.); timeout is in seconds. Set background: true for long-running non-interactive commands. Commands still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background and wake you with a pi-background-bash result when finished.`,
 		promptGuidelines: [
 			"Use bash with background: true for long-running non-interactive commands such as builds, full test suites, dev servers, watchers, deploys, downloads, or commands you do not need before the next step.",
 			`Use bash normally for shell commands; Pi automatically moves bash commands that run longer than the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) to the background.`,
 			"When bash reports that a command started or moved to background, do not retry it just to wait; continue independent work or tell the user the job is running.",
 			"Use the pbb CLI (`pbb list`, `pbb status <job>`, `pbb tail <job>`) only when you need progress before the completion follow-up arrives, need full truncated logs, or need to manage a job; pbb is on PATH inside bash commands and defaults to this session + this instance of it. Other instances of this session need `--scope session`; other sessions (sibling sessions, subagents) need `--scope all` / `--all`.",
-			"When a <pi_context source=\"pi-background-bash\" kind=\"background_bash_result\"> message appears, treat it like the final result of the original bash command.",
-			"A <pi_context source=\"pi-background-bash\" kind=\"background_bash_digest\"> message lists background completions that were recorded while no live session could receive them; treat every entry as a final result (an entry with outcome=lost has an unknown outcome — inspect its log instead of assuming success).",
+			"When a plain-text background bash result message arrives, treat it like the final result of the original bash command; its details carry the job id, command, outcome and duration.",
+			"A background bash digest message lists background completions that were recorded while no live session could receive them; treat every entry as a final result (an entry with outcome=lost has an unknown outcome — inspect its log instead of assuming success).",
+			"Full output of a job lives in its log file for 7 days (afterwards only what your transcript retains survives); a log is never deleted while its job is running or before its completion is delivered.",
 			"Do not use bash for interactive commands that require stdin unless the user explicitly asks for that behavior.",
 		],
 		parameters: Type.Object({

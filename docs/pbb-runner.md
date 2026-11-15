@@ -8,13 +8,16 @@ PBB is the baseline bash runner for pi-background-bash v1.
 - Background jobs are owned by PBB from process start, and owned *per session*: one pi process serves several sessions (`/new`, `/resume`, subagents) and each owns only its own jobs.
 - Job IDs use fixed-width local IDs: `bg001`, `bg002`, ..., `bg999`, then `bg1000`. IDs are unique per instance directory; the allocator is process-wide so two sessions sharing an instance directory cannot collide.
 - Jobs record `pid` and `pgid` for process-group control.
-- A session runs at most `maxActiveJobs` (default 20, configurable globally and per project)
+- A session runs at most `maxActiveJobs` (default 10, configurable globally and per project)
   background jobs; a call past the cap is refused with a message pointing at `pbb kill <jobid>`,
   so the model frees a slot instead of waiting for one job to end.
 - `pbb list`, `pbb status` and `pbb tail` inspect the recorded job state/logs.
 - `pbb kill` requests live owner shutdown through the instance mailbox.
 - `pbb kill --stale --instance <id> <job>` explicitly signals a stale recorded process group.
 - Verbose completion messages are truncated in-session and point to `pbb tail <job> --full` for complete output.
+- Completions are plain text (pi's convention for tool results): a one-line header names the job
+  id, the outcome, the duration and — where one honestly exists — the exit code, and the trimmed
+  body follows; the same facts sit in the message's structured `details` (`details.jobId` et al.).
 - `pbb` is put on `PATH` for spawned commands (`<root>/bin/pbb` shim); per-spawn `PBB_*`/`PI_LANE_SESSION_*` identity is never written into `process.env`.
 
 ## Scope (session + instance)
@@ -156,7 +159,8 @@ this layer's own.
 At `session_start` the extension scans its own `sessionKey`'s job files (never another session's —
 filtered on the stored `sessionKey`, not on the directory) and:
 
-- re-delivers terminal jobs with `delivered: false` as **one** coalesced `background_bash_digest` message (max 20 entries per start; the rest are deferred);
+- re-delivers terminal jobs with `delivered: false` as **one** coalesced plain-text digest message (custom type
+  `background_bash_result` with `details.digest: true`; max 20 entries per start; the rest are deferred);
 - finalizes `running`/`kill_requested` jobs whose recorded `pid` **and** `pgid` are both gone as `lost`, with the log tail in the digest;
 - marks completions older than 24h as not re-delivered (`deliveredReason: "reconcile_expired"`) instead of replaying ancient history.
 

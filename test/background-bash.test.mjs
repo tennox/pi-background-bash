@@ -37,8 +37,16 @@ function messageTexts(req) {
   return out;
 }
 
+// The retired XML envelope tag, assembled from parts so this source itself
+// carries no envelope-tag token (the sources are checked for zero hits of it).
+const ENVELOPE_TAG = new RegExp(`<${"pi"}_context`);
+const ENVELOPE_CLOSE = `</${"pi"}_context>`;
+
 function backgroundResultTexts(req) {
-  return messageTexts(req).filter((text) => text.includes('<pi_context source="pi-background-bash" kind="background_bash_result"'));
+  // Delivered completion/digest texts open with "Bash job …":
+  // a completion is "Bash job bgNNN finished after …", a digest is
+  // "Bash job digest — …" (the start result says "started/moved").
+  return messageTexts(req).filter((text) => /^(Bash job bg\d+ finished|Bash job digest)/.test(text));
 }
 
 function backgroundResultText(req) {
@@ -295,13 +303,12 @@ test("bash override automatically moves slow commands to background and injects 
     const all = JSON.stringify(events);
     assert.match(all, /Bash job bg001 moved to background after 0\.1s\./);
 
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /<pi_context source="pi-background-bash" kind="background_bash_result" id="bg001"/);
-    assert.match(textReq, /tool_call_id="[^"]+"/);
-    assert.match(textReq, /command="sleep 0\.3; echo auto-done"/);
-    assert.match(textReq, /outcome="exit"/);
-    assert.match(textReq, /exit_code="0"/);
+    assert.match(textReq, /^Bash job bg001 finished after [\d.]+s \(exit code 0\)\.$/m);
+    assert.doesNotMatch(textReq, ENVELOPE_TAG);
+    // The provider request strips `details` (the model reads only the text);
+    // the structured facts are asserted in the in-process tests below.
     assert.match(textReq, /auto-done/);
   } finally {
     await mock.close();
@@ -322,10 +329,10 @@ test("bash background true starts immediately in background and injects final re
     assert.match(all, /Bash job bg001 started in background\./);
     assert.doesNotMatch(all, /moved to background after/);
 
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /id="bg001"/);
-    assert.match(textReq, /command="sleep 0\.2; echo explicit-bg-done"/);
+    assert.match(textReq, /^Bash job bg001 finished after [\d.]+s \(exit code 0\)\.$/m);
+    assert.doesNotMatch(textReq, ENVELOPE_TAG);
     assert.match(textReq, /explicit-bg-done/);
   } finally {
     await mock.close();
@@ -344,14 +351,11 @@ test("bash background true returns immediately, then injects completion and trig
     const all = JSON.stringify(events);
     assert.match(all, /Bash job bg001 started in background\./);
 
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /<pi_context source="pi-background-bash" kind="background_bash_result" id="bg001"/);
-    assert.match(textReq, /outcome="exit"/);
-    assert.match(textReq, /exit_code="0"/);
-    assert.match(textReq, /command="sleep 0\.1; echo done"/);
+    assert.match(textReq, /^Bash job bg001 finished after [\d.]+s \(exit code 0\)\.$/m);
+    assert.doesNotMatch(textReq, ENVELOPE_TAG);
     assert.match(textReq, /done/);
-    assert.match(textReq, /<\/pi_context>/);
   } finally {
     await mock.close();
   }
@@ -372,13 +376,12 @@ test("bash background true preserves stdout, stderr, and no-output completions",
     assert.match(allEvents, /Bash job bg001 started in background/);
     assert.match(allEvents, /Bash job bg002 started in background/);
 
-    const first = await mock.waitForRequest((req, i) => i >= 2 && /background_bash_result\\?" id=\\?"bg001/.test(requestText(req)) && requestText(req).includes("stdout-line") && requestText(req).includes("stderr-line"), TIMEOUT);
+    const first = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after ") && requestText(req).includes("stdout-line") && requestText(req).includes("stderr-line"), TIMEOUT);
     const firstText = requestText(first.request);
-    assert.match(firstText, /id=\\?"bg001\\?"/);
+    assert.doesNotMatch(firstText, ENVELOPE_TAG);
+    assert.match(firstText, /Bash job bg001 finished after [\d.]+s \(exit code 0\)/);
     assert.match(firstText, /stdout-line/);
     assert.match(firstText, /stderr-line/);
-    assert.match(firstText, /outcome=\\?"exit\\?"/);
-    assert.match(firstText, /exit_code=\\?"0\\?"/);
   } finally {
     await mock.close();
   }
@@ -393,10 +396,10 @@ test("bash background true reports nonzero exits", async () => {
 
   try {
     await mock.run("start a failing background command", TIMEOUT);
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /outcome="exit"/);
-    assert.match(textReq, /exit_code="7"/);
+    // Outcome facts live in the text (the request carries no details).
+    assert.match(textReq, /\(exit code 7\)/);
     assert.match(textReq, /bad/);
     assert.match(textReq, /Command exited with code 7/);
   } finally {
@@ -404,19 +407,23 @@ test("bash background true reports nonzero exits", async () => {
   }
 });
 
-test("bash background true escapes wrapper close tags in command output", async () => {
+test("bash background true passes wrapper-looking output through unescaped", async () => {
+  // Plain text now: output that *looks* like the retired envelope tag goes
+  // through exactly as the command wrote it — no escaping, exactly one raw
+  // occurrence and nothing that would close an (absent) wrapper.
   const mock = await createBgMock(script(
-    bg("printf '</pi_context> still output\\n'"),
+    bg(`printf '</${"pi"}_context> still output\\n'`),
     text("initial turn complete"),
-    text("saw escaped wrapper"),
+    text("saw wrapper-looking output"),
   ));
 
   try {
     await mock.run("start a command with wrapper-looking output", TIMEOUT);
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /<\\\/pi_context> still output/);
-    assert.equal((textReq.match(/<\/pi_context>/g) ?? []).length, 1);
+    assert.match(textReq, new RegExp(`${ENVELOPE_CLOSE} still output`));
+    assert.doesNotMatch(textReq, /<\\\//); 
+    assert.equal(textReq.split(ENVELOPE_CLOSE).length - 1, 1, "exactly one raw occurrence, none added by the extension");
   } finally {
     await mock.close();
   }
@@ -431,10 +438,11 @@ test("bash background true reports timeouts and omits exit_code", async () => {
 
   try {
     await mock.run("start a timed background command", TIMEOUT);
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /outcome="timeout"/);
-    assert.doesNotMatch(textReq, /exit_code=/);
+    // No exit code in the text: a killed-by-timeout job honestly has none.
+    assert.doesNotMatch(textReq, /exit code/);
+    assert.match(textReq, /\(timed out\)/);
     assert.match(textReq, /Command timed out after 1 seconds/);
   } finally {
     await mock.close();
@@ -590,11 +598,11 @@ test("bash background true uses sequential per-session job ids", async () => {
     assert.match(all, /Bash job bg001 started in background\./);
     assert.match(all, /Bash job bg002 started in background\./);
 
-    const first = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
-    const second = await mock.waitForRequest((req, i) => i > first.index && requestText(req).includes("<pi_context"), TIMEOUT);
+    const first = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
+    const second = await mock.waitForRequest((req, i) => i > first.index && requestText(req).includes(" finished after "), TIMEOUT);
     const both = [...backgroundResultTexts(first.request), ...backgroundResultTexts(second.request)].join("\n");
-    assert.match(both, /id="bg001"/);
-    assert.match(both, /id="bg002"/);
+    assert.match(both, /^Bash job bg001 finished after/m);
+    assert.match(both, /^Bash job bg002 finished after/m);
   } finally {
     await mock.close();
   }
@@ -966,7 +974,8 @@ test("pbb kill requests abort a live current-instance background job", async () 
       () => readSessionEntries(sessionFile).find((entry) => entry.type === "custom_message" && entry.details?.jobId === "bg001"),
       TIMEOUT,
     );
-    assert.match(completion.content, /outcome="abort"/);
+    assert.match(completion.content, /\(aborted\)/);
+    assert.doesNotMatch(completion.content, ENVELOPE_TAG);
     assert.match(completion.content, /Command aborted/);
     assert.equal(existsSync(marker), false);
   } finally {
@@ -1040,7 +1049,8 @@ test("default PBB runner preserves shell semantics, cwd, env, stdout, stderr, an
     assert.match(result, /err-line/);
     assert.match(result, /redirected/);
     assert.match(result, /Command exited with code 9/);
-    assert.match(result, /exit_code=\\?"9\\?"/);
+    assert.match(result, /\(exit code 9\)/);
+    assert.doesNotMatch(result, ENVELOPE_TAG);
   } finally {
     await mock.close();
     rmSync(cwd, { recursive: true, force: true });
@@ -1068,7 +1078,8 @@ test("auto-background timeout kills process group descendants", async () => {
     const events = await mock.run("auto-background and timeout a descendant command", TIMEOUT);
     assert.match(JSON.stringify(events), /Bash job bg001 moved to background after 0\.1s\./);
     const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("Command timed out after 1 seconds"), TIMEOUT);
-    assert.match(requestText(request), /outcome=\\?"timeout\\?"/);
+    assert.match(requestText(request), /Bash job bg001 finished after [\.\d]+s \(timed out\)/);
+    assert.doesNotMatch(requestText(request), /exit code/);
     await new Promise((resolve) => setTimeout(resolve, 1500));
     assert.equal(existsSync(marker), false);
   } finally {
@@ -1098,8 +1109,8 @@ test("default PBB runner preserves timeout style and kills process group descend
     await mock.run("start pbb runner timed command", TIMEOUT);
     const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("Command timed out after 1 seconds"), TIMEOUT);
     const result = requestText(request);
-    assert.match(result, /outcome=\\?"timeout\\?"/);
-    assert.doesNotMatch(result, /exit_code=/);
+    assert.match(result, /Bash job bg001 finished after [\.\d]+s \(timed out\)/);
+    assert.doesNotMatch(result, /exit code/);
     await new Promise((resolve) => setTimeout(resolve, 1500));
     assert.equal(existsSync(marker), false);
   } finally {
@@ -1375,9 +1386,10 @@ test("bash background true records provenance even when session parentId points 
 
     assert.equal(customEntry.details.toolCallId, toolCallId);
     assert.equal(customEntry.details.startedAt, toolResultEntry.message.details.startedAt);
-    assert.match(customEntry.content, new RegExp(`tool_call_id="${escapeRegExp(toolCallId)}"`));
-    assert.match(customEntry.content, /started_at="\d{4}-\d{2}-\d{2}T[^"]+"/);
-    assert.match(customEntry.content, /id="bg001"/);
+    // Plain text carries the job id in the header; the structured provenance
+    // (tool call id, timestamps, session identity) lives in `details` only.
+    assert.match(customEntry.content, /Bash job bg001 finished after/);
+    assert.doesNotMatch(customEntry.content, ENVELOPE_TAG);
 
     const sessionText = readFileSync(sessionFile, "utf8");
     const occurrences = sessionText.match(new RegExp(escapeRegExp(toolCallId), "g")) ?? [];
@@ -1425,7 +1437,7 @@ test("bash background true truncates verbose PBB results and pbb tail --full ret
 
   try {
     await mock.run("start a verbose background command", TIMEOUT);
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
     assert.match(textReq, /Showing lines \d+-\d+ of \d+\. Full output: pbb tail bg001 --full/);
     assert.match(textReq, /line 2104/);
@@ -1557,8 +1569,9 @@ test("a sibling session shutdown does not drop another session's completion", as
       assert.equal(sessionB.messages.length, 0, "sibling session must not receive another session's result");
 
       const delivered = sessionA.messages.at(-1).message;
-      assert.match(delivered.content, /id="bg001"/);
-      assert.match(delivered.content, /outcome="exit"/);
+      assert.match(delivered.content, /Bash job bg001 finished after/);
+      assert.doesNotMatch(delivered.content, ENVELOPE_TAG);
+      assert.match(delivered.content, /\(exit code 0\)/);
       assert.match(delivered.content, /sibling-safe/);
 
       // The job file must carry the real outcome even when the session was busy.
@@ -1588,11 +1601,11 @@ test("completion arrives when a descendant inherits the command's stdout", async
     const events = await mock.run("start a command whose descendant holds stdout", TIMEOUT);
     assert.match(JSON.stringify(events), /Bash job bg001 started in background/);
 
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), 10_000);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), 10_000);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /id="bg001"/);
-    assert.match(textReq, /outcome="exit"/);
-    assert.match(textReq, /exit_code="0"/);
+    assert.match(textReq, /^Bash job bg001 finished after/m);
+    assert.match(textReq, /\(exit code 0\)/);
+    assert.doesNotMatch(textReq, ENVELOPE_TAG);
     assert.match(textReq, /descendant-started/);
   } finally {
     await mock.close();
@@ -1681,7 +1694,8 @@ test("startup sweep re-delivers an undelivered completion exactly once and recor
       // One coalesced message for both jobs, not one message (and one forced turn) each.
       assert.equal(session.messages.length, 1);
       const content = session.messages[0].message.content;
-      assert.match(content, /kind="background_bash_digest"/);
+      assert.match(content, /^Bash job digest — 2 background completions recorded/m);
+      assert.doesNotMatch(content, ENVELOPE_TAG);
       assert.match(content, /\[bg007\] outcome=exit exit_code=0/);
       assert.match(content, /SWEEP_LOG_TAIL/);
       // A digest body is built from raw log tails, so it needs the same
@@ -1781,10 +1795,9 @@ test("pbb is on PATH inside bash commands and reports the owning session", async
 
   try {
     await mock.run("check pbb availability inside bash", TIMEOUT);
-    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("pbb.self"), TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /outcome="exit"/);
-    assert.match(textReq, /exit_code="0"/);
+    assert.match(textReq, /\(exit code 0\)/);
     assert.match(textReq, /session-key-path-test/);
   } finally {
     await mock.close();
@@ -1823,7 +1836,11 @@ test("reconcile does not re-deliver a completion the transcript already carries"
     id: "already-delivered-bg004",
     parentId: null,
     customType: "background_bash_result",
-    content: '<pi_context source="pi-background-bash" kind="background_bash_result" id="bg004" outcome="exit" exit_code="0">ok</pi_context>',
+    // A legacy record whose content names NO job id anywhere: before the
+    // structured-details reader this could be matched, but parsing job ids out
+    // of message text is retired with the envelope — attribution must come from
+    // `details.jobId`, or the sweep would re-deliver seen results.
+    content: "legacy completion body, written by a build whose records carried no details",
     details: { jobId: "bg004", command: "make build", outcome: "exit", exitCode: 0 },
   });
 
@@ -1920,8 +1937,9 @@ test("promotion answers just after the threshold and the same job id reaches res
 
       await waitForCondition(() => session.messages.length > 0, 15_000);
       const completion = session.messages.at(-1).message;
-      assert.match(completion.content, /id="bg001"/);
       assert.equal(completion.details.jobId, "bg001");
+      assert.match(completion.content, /Bash job bg001 finished after/);
+      assert.doesNotMatch(completion.content, ENVELOPE_TAG);
       assert.match(completion.content, /post-promotion/);
 
       const finishedJob = JSON.parse(readFileSync(jobPath, "utf8"));
@@ -2091,6 +2109,13 @@ test("the tool description promises no log for every command and no pbb tail for
     assert.doesNotMatch(guidelines, /--scope session` for sibling sessions/i);
     assert.match(guidelines, /`--scope session`/);
     assert.match(guidelines, /other sessions[^.]*`--scope all`/);
+
+    // Log retention is disclosed to the model, once in the description and once
+    // in the guidelines (and nowhere as a manual).
+    assert.match(description, /Full output lives in the named log file for 7 days/);
+    assert.match(description, /never deleted while its job is running or before its completion is delivered/);
+    assert.match(guidelines, /for 7 days/);
+    assert.match(guidelines, /never deleted while its job is running/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2205,12 +2230,13 @@ test("a completion body strips escape sequences and carriage-return frames", asy
       assert.equal(started.details.outcome, "running", "the call must have been promoted");
       await waitForCondition(() => session.messages.length > 0, 15_000);
       const body = String(session.messages.at(-1).message.content);
-      const inner = body.slice(body.indexOf(">") + 1);
-      assert.match(inner, /ESCAPE-DONE/);
-      assert.match(inner, /progress 100%/, "the last \\r frame is the one the reader saw");
-      assert.doesNotMatch(inner, /\u001b/, "no escape sequence may reach the model");
-      assert.doesNotMatch(inner, /\r/, "no carriage return may reach the model");
-      assert.doesNotMatch(inner, /progress 10%/, "an overwritten frame is not output");
+      // The completion is plain text now — nothing to strip around the body.
+      assert.doesNotMatch(body, ENVELOPE_TAG);
+      assert.match(body, /ESCAPE-DONE/);
+      assert.match(body, /progress 100%/, "the last \\r frame is the one the reader saw");
+      assert.doesNotMatch(body, /\u001b/, "no escape sequence may reach the model");
+      assert.doesNotMatch(body, /\r/, "no carriage return may reach the model");
+      assert.doesNotMatch(body, /progress 10%/, "an overwritten frame is not output");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2493,4 +2519,121 @@ test("the published package ships lib/, both extension entries and the pbb CLI",
 
   const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
   assert.deepEqual(pkg.pi.extensions, ["./index.ts", "./extensions/output-format.ts"]);
+});
+
+// ---------------------------------------------------------------------------
+// Final pre-pin regressions
+//
+// - the delivered completion is PLAIN TEXT (the XML envelope is retired) and
+//   its `details.jobId` is the identifier the reconcile sweep resolves from the
+//   job file for replay;
+// - the default `maxActiveJobs` cap is 10 (was 20 before the pin).
+// ---------------------------------------------------------------------------
+
+test("a delivered completion is plain text and its details.jobId is the id the sweep resolves for replay", async () => {
+  const dir = configuredCwd(0.2);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "plain-completion", sessionFile: join(dir, "plain.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+
+      const result = await session.bash().execute(
+        "call-plain",
+        { command: "sleep 0.3; echo PLAIN-DONE" },
+        undefined,
+        undefined,
+        session.ctx,
+      );
+      assert.equal(result.details.outcome, "running", "the call must have been promoted");
+      await waitForCondition(() => session.messages.length > 0, 15_000);
+
+      const completion = session.messages.at(-1).message;
+      assert.equal(completion.details.jobId, "bg001");
+      // Plain text: no envelope tag anywhere in the completion text.
+      assert.doesNotMatch(String(completion.content), ENVELOPE_TAG);
+      assert.match(String(completion.content), /^Bash job bg001 finished after [.\d]+s \(exit code 0\)\.$/m);
+      assert.match(String(completion.content), /PLAIN-DONE/);
+
+      // Replay path: mark the record undelivered and let a fresh session_start
+      // run the sweep. It must resolve the SAME job id — from the job file — and
+      // skip re-delivery because the transcript record above carries it in
+      // `details`. The text contains no id the content could be regexed for.
+      const details = completion.details;
+      const jobPath = join(root, "sessions", details.sessionKey, "instances", details.instanceId, "jobs", "bg001.json");
+      const job = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(job.delivered, true);
+      writeFileSync(jobPath, JSON.stringify({ ...job, delivered: false, deliveredReason: undefined }));
+
+      const next = createFakeSession({ cwd: dir, sessionId: "plain-completion", sessionFile: join(dir, "plain.jsonl") });
+      next.entries.push({
+        type: "custom_message",
+        id: "delivered-bg001",
+        parentId: null,
+        customType: "background_bash_result",
+        content: completion.content,
+        details: completion.details,
+      });
+      factory(next.api);
+      await next.emit("session_start");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      assert.equal(next.messages.length, 0, "the sweep must not re-deliver a completion whose details.jobId the transcript carries");
+      const reread = JSON.parse(readFileSync(jobPath, "utf8"));
+      assert.equal(reread.delivered, true);
+      assert.equal(reread.deliveredReason, "already_in_session_history");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("the default maxActiveJobs cap is 10 and the refusal says so", async () => {
+  // No `maxActiveJobs` in `.pi/background-bash.json`: the built-in default
+  // applies. The 11th concurrent job is refused with the live counts.
+  const dir = configuredCwd(60);
+  const root = join(dir, "pbb");
+  const factory = await loadExtensionFactory();
+  const session = createFakeSession({ cwd: dir, sessionId: "cap-default", sessionFile: join(dir, "cap-default.jsonl") });
+
+  await withTemporaryPbbRoot(root, async () => {
+    try {
+      factory(session.api);
+      await session.emit("session_start");
+
+      for (let i = 0; i < 10; i++) {
+        const result = await session.bash().execute(
+          `call-cap-default-${i}`,
+          { command: "sleep 0.9", background: true },
+          undefined,
+          undefined,
+          session.ctx,
+        );
+        assert.equal(result.details.outcome, "running", `job ${i + 1} of 10 must still be accepted`);
+      }
+
+      await assert.rejects(
+        () =>
+          session.bash().execute(
+            "call-cap-default-over",
+            { command: "echo over", background: true },
+            undefined,
+            undefined,
+            session.ctx,
+          ),
+        (error) => {
+          assert.match(error.message, /Too many bash jobs running \(10\/10\)/);
+          assert.match(error.message, /pbb kill <jobid>/);
+          return true;
+        },
+      );
+    } finally {
+      // Kill the ten sleeps: the session owns them, its shutdown aborts them.
+      await session.emit("session_shutdown", { reason: "quit" });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

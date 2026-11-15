@@ -1,41 +1,18 @@
 /**
  * Local replacements for sshkeda/pi-context (private repository, no longer
- * accessible). Only the three functions used by this extension are
- * reimplemented here:
+ * accessible). The two functions this extension still uses from that trio:
  *
- *  - piContext()             wraps payload text in a <pi_context ...> envelope
  *  - truncateContextText()   tail/head truncation by lines and bytes (UTF-8 aware)
  *  - formatTruncationNotice() display notice for a truncation
+ *
+ * The third, the XML result-envelope builder, was retired along with the
+ * envelope itself: background completions arrive as plain text carrying the
+ * job id, outcome and log pointer in the text, with structured `details`
+ * beside it (pi's own convention for tool results).
  *
  * See https://github.com/mowenroot/pi-background-bash (fork of sshkeda's) for
  * the rationale: the original dependency could not be installed from GitHub.
  */
-
-export interface PiContextAttrs {
-	[key: string]: string | number | boolean | null | undefined;
-}
-
-export interface PiContextOptions {
-	source: string;
-	kind: string;
-	id?: string;
-	attrs?: PiContextAttrs;
-	body?: string;
-}
-
-/**
- * Build a <pi_context> envelope. Attribute values are XML-escaped; the body
- * is emitted as-is (pi-background-bash pre-escapes `</pi_context>` itself so
- * command output cannot prematurely close the envelope).
- */
-export function piContext({ source, kind, id, attrs = {}, body = "" }: PiContextOptions): string {
-	const allAttrs: PiContextAttrs = { source, kind, ...(id ? { id } : {}), ...attrs };
-	const attrStr = Object.entries(allAttrs)
-		.filter(([, v]) => v !== undefined && v !== null)
-		.map(([k, v]) => `${k}="${String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")}"`)
-		.join(" ");
-	return `<pi_context ${attrStr}>${body}</pi_context>`;
-}
 
 export interface TruncationInfo {
 	truncated: boolean;
