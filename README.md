@@ -1,15 +1,15 @@
 # pi-background-bash
 
-Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep using the normal `bash` tool, but long-running commands stop blocking the agent.
+Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep the normal `bash` tool, but long-running commands stop blocking the agent.
+A command starts in the background immediately with `background: true`, and a foreground call still running after 30 seconds is promoted to a background job (threshold configurable).
+Promoted jobs are recorded on disk — `pid`/`pgid`, events, a raw size-capped log — and inspectable with [`pbb`](#pbb-cli); when a promoted job finishes, its result is delivered into the session as plain text with structured details and the agent is woken.
+A second extension entry in this package ([output layer](#output-formatting)) reshapes the model-facing text of results pi already truncated into first lines + last lines + the log path.
 
-`pi-background-bash` replaces Pi's bash execution with the PBB runner and adds two quality-of-life features:
+## Provenance
 
-- `background: true` starts a command in the background immediately.
-- normal foreground commands automatically move to the background after 30 seconds.
-
-As of v1, PBB-owned execution is the baseline: background jobs are recorded with logs plus `pid`/`pgid`, and a background job's full output is available through `pbb tail` (a small foreground call that was neither truncated nor promoted leaves no log behind).
-
-When a background command finishes, the extension injects a follow-up result into the session and wakes the agent.
+- **Fork of [`sshkeda/pi-background-bash`](https://github.com/sshkeda/pi-background-bash).** The fork exists for two fixes: upstream's install is broken (it depends on a private `pi-context` repo; the three functions are [inlined](extensions/pi-context-utils.ts)) and background completions crashed on a stale session ctx. Both, with verification, in the [Fork notice](#fork-notice).
+- **Execution core: pi's own bash tool.** The [rework](todo/2026-11-11_bash-extension-rework/PLAN.md) of 2026-11-11/12 stopped re-implementing what pi already owns (environment, output accumulation, truncation, error texts): the extension registers pi's `createBashToolDefinition` and supplies only an `operations.exec` spawn/abort/timeout contract — keeping what is uniquely pbb's: backgrounding, durable job records, delivery + reconcile, the `pbb` CLI. Current state: [STATUS.md](todo/2026-11-11_bash-extension-rework/STATUS.md).
+- **Design input: `pi-bg-bash` (gvanderclay) — surveyed, not vendored.** Its session-scoped background-task model fed this fork's per-session design; its output-sanitizing ideas were superseded by this repo's output layer. Survey + binding design decisions: [COMPARISON.md](todo/2026-11-11_bash-extension-choice/COMPARISON.md).
 
 ## Reliability
 
@@ -44,7 +44,7 @@ pi install npm:pi-background-bash
 Or from this GitHub fork:
 
 ```bash
-pi install git:github.com/mowenroot/pi-background-bash
+pi install git:github.com/tennox/pi-background-bash
 ```
 
 Try without installing:
@@ -59,12 +59,14 @@ pi -e npm:pi-background-bash
 Local development:
 
 ```bash
-git clone https://github.com/mowenroot/pi-background-bash.git
+git clone https://github.com/tennox/pi-background-bash.git
 cd pi-background-bash
 npm install
 npm test
 pi -e .
 ```
+
+On manu's machines this ships as a nix-built package (a store path / dev symlink) instead of `pi install`.
 
 ## Usage
 
