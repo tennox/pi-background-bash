@@ -6,6 +6,15 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { hermeticEnv, scrubInheritedIdentity } from "./helpers/hermetic-env.mjs";
+
+// This suite spawns pi (via pi-mock) and the pbb CLI as children that inherit
+// `process.env`. Run from inside a pi session, that env carries the extension's
+// own identity (PBB_ROOT, PBB_SESSION_KEY…, PI_LANE_*), and the children would
+// impersonate the developer's live session — writing into the real ~/.pi/pbb and
+// reconciling the developer's own undelivered completions into the mock. Scrub
+// once here so every spawn in this file is hermetic (see helpers/hermetic-env.mjs).
+scrubInheritedIdentity();
 
 const EXT = new URL("../extensions/background-bash.ts", import.meta.url).pathname;
 const OUTPUT_FORMAT_EXT = new URL("../extensions/output-format.ts", import.meta.url).pathname;
@@ -66,12 +75,16 @@ function readSessionEntries(path) {
 }
 
 async function createBgMock(brain, options = {}) {
-  const { extensions = [], ...rest } = options;
+  const { extensions = [], env, ...rest } = options;
   return createMock({
     brain,
     extensions: [EXT, ...extensions],
     startupTimeoutMs: 20_000,
     runTimeoutMs: TIMEOUT,
+    // The pi child gets the scrubbed env explicitly (pi-mock merges
+    // `{ ...process.env, ...env }` itself, so an unset var could not be removed
+    // there); a test's own `env` still wins on top.
+    env: hermeticEnv(env),
     ...rest,
   });
 }
@@ -1579,12 +1592,59 @@ test("bash background true sends a verbose completion with head, omitted marker 
     assert.match(textReq, /… 2987 lines \/ [\d.]+KB omitted …/);
     // Tail: the last lines, in order.
     assert.match(textReq, /\n2991\n2992\n2993[\s\S]*\n3000$/m);
-    // Footer describes both windows and names the route to everything.
-    assert.match(textReq, /\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: pbb tail bg001 --full\]/);
+    // Footer describes both windows and names the full output — as the log file's
+    // path first (decision 2: the bytes are always reachable as a file), with the
+    // CLI form as a convenience after it.
+    assert.match(
+      textReq,
+      /\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: \/[^\n]*\/logs\/bg001\.log \(or: pbb tail bg001 --full\)\]/,
+    );
 
     const tail = execFileSync(process.execPath, [PBB_CLI, "tail", "bg001", "--full"], { env: { ...process.env, ...env }, encoding: "utf8" });
     assert.match(tail, /^1$/m);
     assert.match(tail, /^3000$/m);
+  } finally {
+    await mock.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Decision 2 (COMPARISON.md): the full output is always available **as a file**, so
+// the visible pointer names the path. It used to name only `pbb tail bg001 --full`,
+// which made the model run a command to find bytes that were already on disk.
+test("the completion footer names the full output as an existing path, with the CLI form after it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pointer-${process.pid}-${Date.now()}-`));
+  const env = {
+    PBB_ROOT: join(dir, "pbb"),
+    PI_LANE_SESSION_ID: "session-pointer-test",
+    PI_LANE_SESSION_KEY: "session-key-pointer-test",
+    PI_LANE_SESSION_FILE: join(dir, "session.jsonl"),
+    PI_LANE_INSTANCE_ID: "instance-pointer-test",
+    PI_LANE_CURRENT_LANE: "main",
+  };
+  const mock = await createBgMock(script(
+    bg("seq 1 3000"),
+    text("initial turn complete"),
+    text("saw the completion"),
+  ), { env });
+
+  try {
+    await mock.run("start a verbose background command", TIMEOUT);
+    const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
+    const completion = backgroundResultText(request);
+    const footer = completion.split("\n").at(-1);
+    const named = /\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: (.+?)(?: \(or: (.+)\))?\]$/.exec(footer);
+    assert.ok(named, `the completion body must end in the full-output pointer: ${footer}`);
+    const [, path, hint] = named;
+    assert.ok(path.startsWith("/"), `the pointer leads with an absolute path, not a command: ${path}`);
+    assert.ok(existsSync(path), `the named path exists: ${path}`);
+    assert.match(path, /\/logs\/bg001\.log$/);
+    assert.equal(hint, "pbb tail bg001 --full", "the CLI form is a convenience after the path");
+    const full = readFileSync(path, "utf8");
+    assert.match(full, /^1$/m);
+    assert.match(full, /^3000$/m);
+    // One footer line, not a second notice elsewhere in the body.
+    assert.equal((completion.match(/Full output:/g) ?? []).length, 1);
   } finally {
     await mock.close();
     rmSync(dir, { recursive: true, force: true });

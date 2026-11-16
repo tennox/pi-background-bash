@@ -240,16 +240,16 @@ function windowLabel(window: ShownWindow): string {
 function shownFooter(
 	totalLines: number,
 	windows: { head?: ShownWindow; tail?: ShownWindow },
-	options: { fullOutputPath?: string; byteLimit?: number },
+	options: FullOutputPointer & { byteLimit?: number },
 ): string {
 	const parts: string[] = [];
 	if (windows.head && windows.head.lines > 0) parts.push(windowLabel(windows.head));
 	if (windows.tail && windows.tail.lines > 0) parts.push(windowLabel(windows.tail));
 	const limit = options.byteLimit !== undefined ? ` (${formatSize(options.byteLimit)} limit)` : "";
-	const path = options.fullOutputPath ? `. Full output: ${options.fullOutputPath}` : "";
+	const pointer = fullOutputPointer(options);
 	// With no window at all (a big file whose line count is unknown) still say so.
 	const shown = parts.length > 0 ? `lines ${parts.join(" and ")}` : "no lines";
-	return `[Showing ${shown} of ${totalLines}${limit}${path}]`;
+	return `[Showing ${shown} of ${totalLines}${limit}${pointer}]`;
 }
 
 /**
@@ -257,13 +257,42 @@ function shownFooter(
  * first/last byte windows were read): the counts are ours, so they are the only
  * honest numbers available.
  */
-function windowCountFooter(windows: { head?: ShownWindow; tail?: ShownWindow }, fullOutputPath?: string): string {
+function windowCountFooter(windows: { head?: ShownWindow; tail?: ShownWindow }, options: FullOutputPointer): string {
 	const parts: string[] = [];
 	if (windows.head && windows.head.lines > 0) parts.push(`the first ${windows.head.lines} line${windows.head.lines === 1 ? "" : "s"}`);
 	if (windows.tail && windows.tail.lines > 0) parts.push(`the last ${windows.tail.lines} line${windows.tail.lines === 1 ? "" : "s"}`);
 	const shown = parts.length > 0 ? parts.join(" and ") : "no lines";
-	const path = fullOutputPath ? `. Full output: ${fullOutputPath}` : "";
-	return `[Showing ${shown}${path}]`;
+	return `[Showing ${shown}${fullOutputPointer(options)}]`;
+}
+
+/** How a footer points at the full output. */
+export interface FullOutputPointer {
+	/**
+	 * The full output **as a file path** (COMPARISON.md decision 2): every result's
+	 * bytes exist on disk, so the model can `rg`/`tail` them without running
+	 * anything. This is what the footer names.
+	 */
+	fullOutputPath?: string;
+	/**
+	 * An optional convenience command for the same bytes (e.g.
+	 * `pbb tail bg001 --full`), appended after the path — never a substitute for
+	 * it: a job id is a pbb-internal handle, a path is the file itself.
+	 */
+	fullOutputHint?: string;
+}
+
+/**
+ * The `. Full output: …` pointer of a footer, on the footer's own single line.
+ *
+ * Path first, always; the hint (if any) in parentheses after it, so a reader
+ * that only has the command still finds the bytes and one that has neither
+ * learns nothing false. With no path the hint stands alone (the reconcile digest
+ * names several jobs, so it has no single file to point at).
+ */
+function fullOutputPointer({ fullOutputPath, fullOutputHint }: FullOutputPointer): string {
+	const target =
+		fullOutputPath && fullOutputHint ? `${fullOutputPath} (or: ${fullOutputHint})` : (fullOutputPath ?? fullOutputHint);
+	return target ? `. Full output: ${target}` : "";
 }
 
 /* ------------------------------------------------------------------------- *
@@ -293,7 +322,7 @@ export interface TruncationFacts {
 	maxBytes?: number;
 }
 
-export interface FormatForModelOptions {
+export interface FormatForModelOptions extends FullOutputPointer {
 	text: string;
 	/** pi's `details.fullOutputPath`: the full output exists as a file. */
 	fullOutputPath?: string;
@@ -577,9 +606,10 @@ export function formatForModel(options: FormatForModelOptions): string {
 	};
 	// A partial last line has no line number to report: keep pi's own wording.
 	const footer = truncation?.lastLinePartial
-		? (notice ?? shownFooter(totalLines, windows, { fullOutputPath }))
+		? (notice ?? shownFooter(totalLines, windows, { fullOutputPath, fullOutputHint: options.fullOutputHint }))
 		: shownFooter(totalLines, windows, {
 				fullOutputPath,
+				fullOutputHint: options.fullOutputHint,
 				byteLimit: truncation?.truncatedBy === "bytes" ? (truncation.maxBytes ?? DEFAULT_OUTPUT_FORMAT.maxBytes) : undefined,
 			});
 	return assemble({ head, tail, omittedLines, omittedBytes, footer, notices: [...trailing, ...extractedTrailing] });
@@ -589,12 +619,12 @@ export function formatForModel(options: FormatForModelOptions): string {
  * The completion-body variant: read only the first and last bytes of a log
  * ------------------------------------------------------------------------- */
 
-export interface FormatLogFileOptions {
+export interface FormatLogFileOptions extends FullOutputPointer {
 	headLines?: number;
 	tailLines?: number;
 	maxLines?: number;
 	maxBytes?: number;
-	/** What reaches the full output (defaults to the path itself), e.g. `pbb tail bg001 --full`. */
+	/** The full output as a path; defaults to the log path this body was read from. */
 	fullOutputPath?: string;
 	/** Extra lines after the footer: how the command ended. */
 	notices?: string[];
@@ -679,6 +709,7 @@ export function formatLogFile(path: unknown, options: FormatLogFileOptions = {})
 	const maxLines = Math.max(1, options.maxLines ?? DEFAULT_OUTPUT_FORMAT.maxLines);
 	const maxBytes = Math.max(1, options.maxBytes ?? DEFAULT_OUTPUT_FORMAT.maxBytes);
 	const fullOutputPath = options.fullOutputPath ?? path;
+	const pointer: FullOutputPointer = { fullOutputPath, fullOutputHint: options.fullOutputHint };
 	const notices = (options.notices ?? []).filter((notice) => notice);
 	if (options.logTruncated) {
 		notices.push(`Log capped at ${humanBytes(options.logBytes ?? 0)}: output written after that point was not recorded.`);
@@ -738,10 +769,7 @@ export function formatLogFile(path: unknown, options: FormatLogFileOptions = {})
 		// `windowCountFooter` counts lines, it does not number them.
 		...(shownTailLines > 0 ? { tail: { first: totalLines !== undefined ? Math.max(1, totalLines - shownTailLines + 1) : 0, lines: shownTailLines } } : {}),
 	};
-	const footer =
-		totalLines !== undefined
-			? shownFooter(totalLines, windows, { fullOutputPath })
-			: windowCountFooter(windows, fullOutputPath);
+	const footer = totalLines !== undefined ? shownFooter(totalLines, windows, pointer) : windowCountFooter(windows, pointer);
 	return assemble({ head, tail, omittedLines: totalLines !== undefined ? Math.max(0, totalLines - headLines - tailLines) : undefined, omittedBytes, footer, notices });
 }
 
@@ -749,11 +777,9 @@ export function formatLogFile(path: unknown, options: FormatLogFileOptions = {})
  * The pi-window cap (completion bodies that are longer than pi's own window)
  * ------------------------------------------------------------------------- */
 
-export interface CapBodyOptions {
+export interface CapBodyOptions extends FullOutputPointer {
 	maxLines?: number;
 	maxBytes?: number;
-	/** What reaches the full output, e.g. `pbb tail bg001 --full`. */
-	fullOutputPath?: string;
 }
 
 /** Truncate a string to the last `maxBytes`, never mid-character (pi's helper, mirrored). */
@@ -794,7 +820,11 @@ export function capBodyToPiWindow(text: string, options: CapBodyOptions = {}): s
 	const footer = shownFooter(
 		totalLines,
 		{ tail: { first: Math.max(1, totalLines - keptLines.length + 1), lines: keptLines.length } },
-		{ fullOutputPath: options.fullOutputPath, byteLimit: truncatedBy === "bytes" ? maxBytes : undefined },
+		{
+			...(options.fullOutputPath ? { fullOutputPath: options.fullOutputPath } : {}),
+			...(options.fullOutputHint ? { fullOutputHint: options.fullOutputHint } : {}),
+			byteLimit: truncatedBy === "bytes" ? maxBytes : undefined,
+		},
 	);
 	return `${kept}\n\n${footer}`;
 }

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const LIB_PATH = new URL("../lib/output-format.ts", import.meta.url).pathname;
@@ -150,6 +150,39 @@ test("formatForModel takes the head from the full-output file, not from pi's tai
     const blocks = body.split("\n\n");
     assert.equal(blocks.at(-2), all.slice(-10).join("\n"), "the tail still comes from the end of the output");
     assert.match(blocks.at(-1), /^\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: .*bg001\.log\]$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the footer of a truncated tool result names the full output as an existing path", async () => {
+  // COMPARISON.md decision 2: the full output is always available as a *file*, so
+  // the visible pointer is a path the model can `rg`/`tail` directly — never only
+  // a command it would have to run first. The optional CLI form comes after the
+  // path, in the same footer line.
+  const { formatForModel } = await loadLib();
+  const dir = tempDir("pointer-path");
+  const logPath = join(dir, "logs", "bg001.log");
+  mkdirSync(join(dir, "logs"), { recursive: true });
+  const all = Array.from({ length: 3000 }, (_, i) => `line-${i + 1}`);
+  writeFileSync(logPath, `${all.join("\n")}\n`);
+  const text = `${all.slice(1000).join("\n")}\n\n[Showing lines 1001-3000 of 3000. Full output: ${logPath}]`;
+  const truncation = { truncated: true, truncatedBy: "lines", totalLines: 3000, outputLines: 2000 };
+  try {
+    const footerOf = (body) => body.split("\n").at(-1);
+
+    const plain = footerOf(formatForModel({ text, fullOutputPath: logPath, truncation, headLines: 3, tailLines: 10 }));
+    const named = /^\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: (.+)\]$/.exec(plain);
+    assert.ok(named, `the footer must end in the full-output pointer: ${plain}`);
+    assert.ok(isAbsolute(named[1]), `the pointer is an absolute path, not a command: ${named[1]}`);
+    assert.ok(existsSync(named[1]), `the named path exists: ${named[1]}`);
+    assert.equal(readFileSync(named[1], "utf8").trimEnd().split("\n").length, 3000, "the path holds the whole output");
+
+    // With a job id at hand the CLI form is appended — still one footer line.
+    const hinted = footerOf(
+      formatForModel({ text, fullOutputPath: logPath, fullOutputHint: "pbb tail bg001 --full", truncation, headLines: 3, tailLines: 10 }),
+    );
+    assert.equal(hinted, `[Showing lines 1-3 and 2991-3000 of 3000. Full output: ${logPath} (or: pbb tail bg001 --full)]`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

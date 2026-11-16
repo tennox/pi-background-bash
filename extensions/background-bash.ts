@@ -823,9 +823,12 @@ function completionNotices(job: ActiveJob, result: JobResult): string[] {
  *
  * Every completion goes through `formatLogFile`, i.e. the **same** head+tail path
  * as a tool result (PLAN §6 + §7b): the log's first `headLines` lines, the omitted
- * marker, its last `tailLines` lines, and `Full output: pbb tail <job> --full`;
- * a log that fits pi's window (2000 lines / 50 KB) is sent whole. A log that hit
- * `maxLogBytes` additionally says that its tail is not the true end of the output.
+ * marker, its last `tailLines` lines, and the full-output pointer naming the log
+ * **as a path** (`…/logs/bg001.log (or: pbb tail bg001 --full)`) — decision 2: the
+ * bytes are a file the model can `rg`/`tail` directly, and the CLI form is only a
+ * convenience next to it. A log that fits pi's window (2000 lines / 50 KB) is sent
+ * whole. A log that hit `maxLogBytes` additionally says that its tail is not the
+ * true end of the output.
  *
  * It used to be a tail window only (`capBodyToPiWindow`), so a promoted
  * `seq 1 3000` delivered 1001-3000 with no head at all — the exact opposite of the
@@ -838,7 +841,9 @@ function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
 		tailLines,
 		maxLines,
 		maxBytes,
-		fullOutputPath: `pbb tail ${job.id} --full`,
+		// The footer names the log file itself (the path `formatLogFile` just read)
+		// and, since a job id is at hand, the CLI form after it.
+		fullOutputHint: `pbb tail ${job.id} --full`,
 		notices: completionNotices(job, result),
 		...(job.logTruncated ? { logTruncated: true, logBytes: job.logBytes ?? 0 } : {}),
 	});
@@ -1506,7 +1511,9 @@ function sendCompletionDigest(session: SessionState, entries: ReconcileEntry[], 
 		{
 			maxLines: MAX_RESULT_LINES,
 			maxBytes: MAX_RESULT_BYTES,
-			fullOutputPath: "pbb tail <job> --scope session --full",
+			// A digest names several jobs, so there is no single log file to point at:
+			// it names the reader instead (no path it could honestly claim).
+			fullOutputHint: "pbb tail <job> --scope session --full",
 		},
 	)}`;
 	const summaries: DigestJobSummary[] = entries.map((entry) => ({
