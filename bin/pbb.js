@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -9,6 +9,16 @@ import { fileURLToPath } from "node:url";
 
 const SCHEMA_VERSION = 1;
 const DEFAULT_TAIL_LINES = 80;
+/**
+ * How many `pil` probes may be in flight during a whole-root sweep.
+ *
+ * `pil instances` is session-scoped (it reads one session's instance records and
+ * takes the session from the environment), so a sweep needs one call per session.
+ * Sequentially that was 514 process spawns in a row: `pbb list --all` took 65-147 s
+ * on a root with 500+ sessions. Probing is therefore off by default for `--all`
+ * (see `attachOwnerLiveness`) and, when asked for with `--owner`, bounded.
+ */
+const OWNER_PROBE_CONCURRENCY = 8;
 const HERE = dirname(fileURLToPath(import.meta.url));
 // The non-hoisted copy of pi-lane. Kept last: it only exists when this package
 // was installed into its own directory, not in the npm install layout pi uses.
@@ -185,15 +195,7 @@ function readPilInstances(id, sessionKey = id.sessionKey) {
     const raw = execFileSync(pil.file, [...pil.args, "instances", "--json"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PI_LANE_ROOT: id.laneRoot || process.env.PI_LANE_ROOT || "",
-        PI_LANE_SESSION_KEY: sessionKey,
-        PI_LANE_SESSION_ID: id.sessionId,
-        PI_LANE_SESSION_FILE: id.sessionFile,
-        PI_LANE_INSTANCE_ID: id.instanceId,
-        PI_LANE_CURRENT_LANE: id.lane,
-      },
+      env: pilEnv(id, sessionKey),
     });
     instances = JSON.parse(raw).instances || [];
   } catch (error) {
@@ -201,6 +203,85 @@ function readPilInstances(id, sessionKey = id.sessionKey) {
   }
   pilInstancesCache.set(sessionKey, instances);
   return instances;
+}
+
+function pilEnv(id, sessionKey) {
+  return {
+    ...process.env,
+    PI_LANE_ROOT: id.laneRoot || process.env.PI_LANE_ROOT || "",
+    PI_LANE_SESSION_KEY: sessionKey,
+    PI_LANE_SESSION_ID: id.sessionId,
+    PI_LANE_SESSION_FILE: id.sessionFile,
+    PI_LANE_INSTANCE_ID: id.instanceId,
+    PI_LANE_CURRENT_LANE: id.lane,
+  };
+}
+
+/** Where pi-lane keeps its per-session instance records (same default as pil). */
+function laneRootDir(id) {
+  return id.laneRoot || process.env.PI_LANE_ROOT || join(homedir(), ".pi", "lane");
+}
+
+/**
+ * Does pi-lane have instance records for this session at all?
+ *
+ * A sweep over hundreds of sessions must not spawn `pil` for a session pi-lane
+ * never recorded: the process would only report an empty list. Checking the
+ * directory is the same read pil would do, without the process. Deliberately NOT
+ * used for the current session, where a broken `pil` install has to stay visible
+ * (`pi_lane_unavailable`, exit 4).
+ */
+function laneSessionRecorded(id, sessionKey) {
+  return existsSync(join(laneRootDir(id), "sessions", sessionKey, "instances"));
+}
+
+/**
+ * The same probe, without blocking the whole sweep: a `--all --owner` pass runs
+ * hundreds of these through a bounded pool (`mapWithConcurrency`).
+ */
+function readPilInstancesAsync(id, sessionKey = id.sessionKey) {
+  // The current session keeps the synchronous path: a broken `pil` install must
+  // stay visible (`pi_lane_unavailable`, exit 4) in the everyday narrow view, not
+  // be skipped by the sweep's cheap "pi-lane never recorded this session" check.
+  if (sessionKey === id.sessionKey) return Promise.resolve(readPilInstances(id, sessionKey));
+  if (pilInstancesCache === undefined) pilInstancesCache = new Map();
+  const cached = pilInstancesCache.get(sessionKey);
+  if (cached !== undefined) return Promise.resolve(cached);
+  if (!laneSessionRecorded(id, sessionKey)) {
+    pilInstancesCache.set(sessionKey, []);
+    return Promise.resolve([]);
+  }
+  const pil = pilCommand(id);
+  return new Promise((resolve) => {
+    execFile(pil.file, [...pil.args, "instances", "--json"], {
+      encoding: "utf8",
+      env: pilEnv(id, sessionKey),
+    }, (error, stdout) => {
+      if (error) {
+        // Same hard failure as the sync path: a broken install must not quietly
+        // degrade liveness to `unknown`.
+        failPil(id, "tracked pi-lane pil command failed", error);
+      }
+      const instances = JSON.parse(stdout).instances || [];
+      pilInstancesCache.set(sessionKey, instances);
+      resolve(instances);
+    });
+  });
+}
+
+/** `map`, with at most `limit` promises in flight. */
+async function mapWithConcurrency(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      out[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 function processAlive(pid) {
@@ -253,8 +334,9 @@ function ownerPidOf(job, record) {
  * When neither source can answer, the owner is `unknown` — never `stale`: pbb not
  * being able to see liveness is not evidence that the owner is gone.
  */
-function ownerInfo(id, job, sessionKey = id.sessionKey) {
-  const lane = readPilInstances(id, sessionKey).find((item) => item.instanceId === job.instanceId);
+function ownerInfo(id, job, sessionKey = id.sessionKey, laneInstances) {
+  const instances = laneInstances ?? readPilInstances(id, sessionKey);
+  const lane = instances.find((item) => item.instanceId === job.instanceId);
   const seen = { ownerLastSeenAt: lane?.lastSeenAt || "", ownerLastSeenAgeMs: lane?.lastSeenAgeMs };
   if (lane) {
     return {
@@ -299,6 +381,51 @@ function ownerInfo(id, job, sessionKey = id.sessionKey) {
     ownerPid: pid,
     ...(note ? { ownerNote: note } : {}),
   };
+}
+
+/**
+ * The owner fields of a job whose liveness was **not** probed (a whole-root
+ * `--all` sweep, where probing every session costs one `pil` process each).
+ *
+ * Honesty rule: not probing is `unknown`, never `stale` — pbb not asking is not
+ * evidence that the owner is gone. `ownerNote` says how to get the real answer.
+ */
+function unprobedOwnerInfo() {
+  return {
+    ownerStatus: "unknown",
+    ownerLiveness: "unknown",
+    ownerLive: false,
+    ownerStale: false,
+    ownerSource: "not-probed",
+    ownerNote: "owner liveness not probed in a whole-root sweep; add --owner",
+  };
+}
+
+/**
+ * Attach owner liveness to a list of jobs.
+ *
+ * `probe: false` marks every job `unknown` without a single subprocess (the
+ * `--all` default). `probe: true` probes once per *session* (never once per job),
+ * bounded by `OWNER_PROBE_CONCURRENCY`, so `--all --owner` over 500 sessions stays
+ * a few seconds instead of the minutes a sequential per-job pass took.
+ */
+async function attachOwnerLiveness(id, jobs, { probe }) {
+  if (jobs.length === 0) return jobs;
+  if (!probe) return jobs.map((job) => ({ ...job, ...unprobedOwnerInfo() }));
+  const sessionKeys = [...new Set(jobs.map((job) => job.sessionKey ?? id.sessionKey))];
+  const laneBySession = new Map();
+  const probed = await mapWithConcurrency(sessionKeys, OWNER_PROBE_CONCURRENCY, (sessionKey) => readPilInstancesAsync(id, sessionKey));
+  sessionKeys.forEach((sessionKey, index) => laneBySession.set(sessionKey, probed[index]));
+  return jobs.map((job) => {
+    const sessionKey = job.sessionKey ?? id.sessionKey;
+    return { ...job, ...ownerInfo(id, job, sessionKey, laneBySession.get(sessionKey)) };
+  });
+}
+
+/** Owner liveness for one already-selected job (status/kill need it, tail does not). */
+function withOwnerInfo(id, job) {
+  if (job.ownerLiveness !== undefined) return job;
+  return { ...job, ...ownerInfo(id, job, job.sessionKey ?? id.sessionKey) };
 }
 
 const SCOPE_CURRENT = "current-instance";
@@ -367,7 +494,10 @@ function readJobs(id, { scope = SCOPE_CURRENT, instance } = {}) {
       const path = join(dir, item);
       const job = readJson(path);
       if (!job) continue;
-      jobs.push({ ...job, sessionKey: job.sessionKey ?? target.sessionKey, ...ownerInfo(id, job, target.sessionKey), _path: path });
+      // Owner liveness is attached by the caller (`attachOwnerLiveness` /
+      // `withOwnerInfo`): it costs one `pil` process per session, and a whole-root
+      // sweep must not pay that per job.
+      jobs.push({ ...job, sessionKey: job.sessionKey ?? target.sessionKey, _path: path });
     }
   }
   return jobs.sort((a, b) => String(a.startedAt ?? "").localeCompare(String(b.startedAt ?? "")) || String(a.jobId).localeCompare(String(b.jobId)));
@@ -416,6 +546,7 @@ function parseArgs(argv) {
     else if (arg === "--lines" || arg === "-n") out.lines = Number(argv[++i]);
     else if (arg === "--signal") out.signal = argv[++i];
     else if (arg === "--stale") out.stale = true;
+    else if (arg === "--owner") out.owner = true;
     else out._.push(arg);
   }
   return out;
@@ -490,25 +621,29 @@ function printInstances(id, opts) {
   if (opts.all && requested && requested !== SCOPE_ALL) usageError(`--all conflicts with --scope ${opts.scope}`);
   if (opts.instance) usageError("pbb instances takes --scope/--all, not --instance");
   const scope = opts.all || requested === SCOPE_ALL ? SCOPE_ALL : SCOPE_SESSION;
-  const instances = [];
-  for (const sessionKey of scope === SCOPE_ALL ? readSessionKeys(id) : [id.sessionKey]) {
-    for (const record of readPilInstances(id, sessionKey)) {
-      instances.push({
-        sessionKey,
-        instanceId: record.instanceId,
-        ownerLive: Boolean(record.live),
-        ownerLiveness: record.live ? "live" : "stale",
-        ownerStatus: record.status || "unknown",
-        ownerLastSeenAt: record.lastSeenAt || "",
-        lane: record.lane || "",
-      });
-    }
-  }
-  const payload = { kind: "pbb.instances", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, source: "pil", instances };
-  if (opts.json) return console.log(json(payload));
-  const line = scope === SCOPE_ALL ? `scope=all — pi-lane instances of every session under ${id.root} (${new Set(instances.map((item) => item.sessionKey)).size} session(s) with instances)` : `scope=session — pi-lane instances of this session (${id.sessionKey})`;
-  const body = instances.map((item) => `- instance=${item.instanceId} live=${item.ownerLive} status=${item.ownerStatus} lane=${item.lane || ""} last_seen=${item.ownerLastSeenAt || "unknown"}${scope === SCOPE_ALL ? ` session=${item.sessionKey}` : ""}`).join("\n");
-  console.log(context("pbb.instances", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, source: "pil", instances: instances.length }, `${line}\n${body || "No instances in scope."}`));
+  const sessionKeys = scope === SCOPE_ALL ? readSessionKeys(id) : [id.sessionKey];
+  // One `pil` call per session — bounded, never sequentially over every session.
+  return mapWithConcurrency(sessionKeys, OWNER_PROBE_CONCURRENCY, (sessionKey) => readPilInstancesAsync(id, sessionKey)).then((recordsBySession) => {
+    const instances = [];
+    sessionKeys.forEach((sessionKey, index) => {
+      for (const record of recordsBySession[index]) {
+        instances.push({
+          sessionKey,
+          instanceId: record.instanceId,
+          ownerLive: Boolean(record.live),
+          ownerLiveness: record.live ? "live" : "stale",
+          ownerStatus: record.status || "unknown",
+          ownerLastSeenAt: record.lastSeenAt || "",
+          lane: record.lane || "",
+        });
+      }
+    });
+    const payload = { kind: "pbb.instances", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, source: "pil", instances };
+    if (opts.json) return console.log(json(payload));
+    const line = scope === SCOPE_ALL ? `scope=all — pi-lane instances of every session under ${id.root} (${new Set(instances.map((item) => item.sessionKey)).size} session(s) with instances)` : `scope=session — pi-lane instances of this session (${id.sessionKey})`;
+    const body = instances.map((item) => `- instance=${item.instanceId} live=${item.ownerLive} status=${item.ownerStatus} lane=${item.lane || ""} last_seen=${item.ownerLastSeenAt || "unknown"}${scope === SCOPE_ALL ? ` session=${item.sessionKey}` : ""}`).join("\n");
+    console.log(context("pbb.instances", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, source: "pil", instances: instances.length }, `${line}\n${body || "No instances in scope."}`));
+  });
 }
 
 function scopeAttrs(id, scope, instance) {
@@ -524,16 +659,24 @@ function scopeAttrs(id, scope, instance) {
 
 function printList(id, opts) {
   const { scope, instance } = resolveScope(opts);
-  const jobs = readJobs(id, { scope, instance });
+  const jobs = attachOwnerLiveness(id, readJobs(id, { scope, instance }), { probe: scope !== SCOPE_ALL || opts.owner === true });
+  return jobs.then((probed) => printListWithJobs(id, opts, scope, instance, probed));
+}
+
+function printListWithJobs(id, opts, scope, instance, jobs) {
   const payload = { kind: "pbb.list", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, ...(scope === SCOPE_INSTANCE ? { instance } : {}), jobs };
   if (opts.json) return console.log(json(payload));
   const counts = jobs.reduce((acc, job) => { acc[job.status] = (acc[job.status] || 0) + 1; return acc; }, {});
   const hint = widenHint(id, scope);
+  const skipped = jobs.some((job) => job.ownerSource === "not-probed")
+    ? "Owner liveness was not probed for this whole-root sweep (add --owner to probe it; unprobed reads as unknown, never stale)."
+    : "";
   console.log(context("pbb.list", {
     ...scopeAttrs(id, scope, instance),
     jobs: jobs.length,
+    ...(skipped ? { owners_probed: false } : {}),
     ...Object.fromEntries(Object.entries(counts).map(([status, count]) => [`jobs_${status}`, count])),
-  }, [describeScope(id, scope, instance), jobs.map(formatJob).join("\n") || "No background bash jobs in scope.", hint].filter(Boolean).join("\n")));
+  }, [describeScope(id, scope, instance), jobs.map(formatJob).join("\n") || "No background bash jobs in scope.", skipped, hint].filter(Boolean).join("\n")));
 }
 
 /** A job id that is not in the current (narrow) scope must say so, not read as "no such job". */
@@ -559,8 +702,10 @@ function printStatus(id, jobId, opts) {
   // A finished job's record already carries the final size, and for a capped log
   // the recorded number is the cap itself — neither may be replaced by a stat.
   const live = ["running", "kill_requested"].includes(found.status) ? liveLogBytes(found) : undefined;
-  const job = live === undefined ? found : { ...found, logBytes: live };
-  if (opts.json) return console.log(json({ kind: "pbb.status", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, job }));
+  const job = withOwnerInfo(id, live === undefined ? found : { ...found, logBytes: live });
+  // `--json`: `jobs` (an array, like `pbb list`) is the canonical shape; `job`
+  // stays as a deprecated alias for the single-object shape older callers read.
+  if (opts.json) return console.log(json({ kind: "pbb.status", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, jobs: [job], job }));
   const cap = formatLogCap(job);
   console.log(context("pbb.status", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, ...(cap ? { log_truncated: true, log_bytes: job.logBytes } : {}), lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, exit_code: job.exitCode, cursor: job.lastEventId }, `${cap ? `${cap}\n` : ""}${json(job)}`));
 }
@@ -574,17 +719,81 @@ function tailText(path, lines, full) {
   return wanted.join("\n");
 }
 
+/** A job id is also a file name; never let one reach outside the logs directory. */
+function looksLikeJobId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value) && !value.includes("..");
+}
+
+/**
+ * Log files named after `jobId`, when there is no job record for it.
+ *
+ * A **foreground** call records no job (by design — pi's own result is the
+ * record), but it does leave `<instance>/logs/<jobId>.log`, and every truncated
+ * result and completion advertises `pbb tail <jobId> --full`. So an advertised
+ * pointer has to work: the log is the fallback. Scoped instances are searched
+ * first, then every session under the root, most recently modified first.
+ */
+function findLogOnlyTargets(id, jobId, scope, instance) {
+  if (!looksLikeJobId(jobId)) return [];
+  const candidates = [];
+  const consider = (sessionKey, instanceId) => {
+    const logPath = join(id.root, "sessions", sessionKey, "instances", instanceId, "logs", `${jobId}.log`);
+    if (!existsSync(logPath)) return;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(logPath).mtimeMs;
+    } catch {
+      // Unreadable stat: still a candidate, just without a recency order.
+    }
+    candidates.push({ sessionKey, instanceId, logPath, mtimeMs });
+  };
+  for (const target of instanceTargets(id, scope, instance)) consider(target.sessionKey, target.instanceId);
+  if (candidates.length === 0 && scope !== SCOPE_ALL) {
+    for (const sessionKey of readSessionKeys(id)) {
+      for (const instanceId of readInstanceIds(id, sessionKey)) consider(sessionKey, instanceId);
+    }
+  }
+  return candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+/**
+ * `pbb tail` for an id that only exists as a log file: report `kind=log-only` and
+ * say where the log came from. No job fields are invented — there is no record.
+ */
+function printLogOnlyTail(id, jobId, opts, scope, instance) {
+  const targets = findLogOnlyTargets(id, jobId, scope, instance);
+  if (targets.length === 0) return false;
+  const found = targets[0];
+  const body = tailText(found.logPath, opts.lines, opts.full);
+  const others = targets.length - 1;
+  const linesAttr = opts.full ? "full" : (opts.lines || DEFAULT_TAIL_LINES);
+  const where = `session=${found.sessionKey} instance=${found.instanceId} log=${found.logPath}`;
+  const note = `no job record for ${jobId} — kind=log-only (a foreground call leaves only its log)\n${where}${others > 0 ? `\n${others} other log(s) named ${jobId}.log exist under ${id.root}; this is the most recently written — use --instance to pick another` : ""}`;
+  if (opts.json) {
+    console.log(json({ kind: "pbb.tail", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, jobId, jobKind: "log-only", logPath: found.logPath, logSessionKey: found.sessionKey, logInstanceId: found.instanceId, logModifiedAt: found.mtimeMs ? new Date(found.mtimeMs).toISOString() : undefined, otherLogCount: others, log: body }));
+    return true;
+  }
+  console.log(context("pbb.tail", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: jobId, job_kind: "log-only", log_session_key: found.sessionKey, log_instance_id: found.instanceId, lines: linesAttr }, `${note}\n${body || "No log output recorded yet."}`));
+  return true;
+}
+
 function printTail(id, jobId, opts) {
   const { scope, instance } = resolveScope(opts);
   const result = findJob(id, jobId, { scope, instance });
   if (!result.job) {
-    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, result.error === "ambiguous" ? `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}\nPick one with: pbb tail ${jobId} --instance <instanceId>` : unknownJobMessage(id, jobId, scope, instance)));
-    process.exit(result.error === "ambiguous" ? 3 : 2);
+    if (result.error === "ambiguous") {
+      console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "ambiguous_job" }, `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}\nPick one with: pbb tail ${jobId} --instance <instanceId>`));
+      process.exit(3);
+    }
+    // No job record: a foreground call's log is still a real, advertised pointer.
+    if (printLogOnlyTail(id, jobId, opts, scope, instance)) return;
+    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: "unknown_job" }, unknownJobMessage(id, jobId, scope, instance)));
+    process.exit(2);
   }
   const job = result.job;
   const logPath = job.logPath || join(id.root, "sessions", job.sessionKey ?? id.sessionKey, "instances", job.instanceId, "logs", `${job.jobId}.log`);
   const body = tailText(logPath, opts.lines, opts.full);
-  if (opts.json) return console.log(json({ kind: "pbb.tail", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, job, log: body }));
+  if (opts.json) return console.log(json({ kind: "pbb.tail", schemaVersion: SCHEMA_VERSION, sessionId: id.sessionId, sessionKey: id.sessionKey, instanceId: id.instanceId, lane: id.lane, scope, jobKind: "job", job, log: body }));
   const cap = formatLogCap(job);
   const note = cap ? `${cap} — the file does not contain the full output\n` : "";
   console.log(context("pbb.tail", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, cursor: job.lastEventId, ...(cap ? { log_truncated: true, log_bytes: job.logBytes } : {}), lines: opts.full ? "full" : (opts.lines || DEFAULT_TAIL_LINES) }, `${note}${body || "No log output recorded yet."}`));
@@ -617,7 +826,7 @@ function printKill(id, jobId, opts) {
     console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: jobId, error: result.error === "ambiguous" ? "ambiguous_job" : "unknown_job" }, result.error === "ambiguous" ? `ambiguous job ${jobId}\n${result.jobs.map((job) => `${job.instanceId}:${job.jobId}`).join("\n")}\nPick one with: pbb kill ${jobId} --instance <instanceId>` : unknownJobMessage(id, jobId, scope, instance)));
     process.exit(result.error === "ambiguous" ? 3 : 2);
   }
-  const job = result.job;
+  const job = withOwnerInfo(id, result.job);
   if (!["running", "kill_requested"].includes(job.status)) {
     console.log(context("pbb.kill", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, status: job.status, requested: false }, `${job.jobId} is not running; no kill requested`));
     return;
@@ -662,7 +871,7 @@ const command = opts._[0] || "list";
 const id = identity();
 
 if (["help", "--help", "-h"].includes(command)) {
-  console.log(`pbb - Pi background bash inspector\n\nCommands:\n  pbb self [--json]\n  pbb list [--scope current-instance|session|all] [--all] [--instance ID] [--json]\n  pbb instances [--scope session|all] [--all] [--json]\n  pbb status [JOB] [--scope ...] [--json]\n  pbb tail JOB [-n LINES] [--full] [--json]\n  pbb kill JOB [--stale] [--signal TERM]\n\nScope: the default view is THIS session + THIS instance. --scope session widens to every\ninstance of this session; --all (same as --scope all) widens to every session under the root.\nJobs from sibling instances, subagent sessions and other sessions are hidden by default.\nScope comes from PI_LANE_* env vars (pi-lane); pbb self shows the resolved identity.`);
+  console.log(`pbb - Pi background bash inspector\n\nCommands:\n  pbb self [--json]\n  pbb list [--scope current-instance|session|all] [--all] [--instance ID] [--owner] [--json]\n  pbb instances [--scope session|all] [--all] [--json]\n  pbb status [JOB] [--scope ...] [--json]\n  pbb tail JOB [-n LINES] [--full] [--json]\n  pbb kill JOB [--stale] [--signal TERM]\n\nScope: the default view is THIS session + THIS instance. --scope session widens to every\ninstance of this session; --all (same as --scope all) widens to every session under the root.\nJobs from sibling instances, subagent sessions and other sessions are hidden by default.\nOwner liveness: --all does NOT probe it (one pil process per session made it take minutes);\nthose owners read \`owner=unknown\` and \`--owner\` probes them (bounded, a few seconds).\n--json: \`list\` and \`status\` both carry \`jobs\` (an array; canonical). \`status\` also keeps\nthe single-object \`job\` key as a deprecated alias. \`tail\` reports \`jobKind: log-only\` for an\nid that only exists as a log file (a foreground call records no job).\nScope comes from PI_LANE_* env vars (pi-lane); pbb self shows the resolved identity.`);
   process.exit(0);
 }
 
@@ -674,22 +883,32 @@ if (command === "self" || command === "whoami") {
 requireIdentity(id);
 mkdirSync(instanceDir(id), { recursive: true });
 
-if (command === "list" || command === "ls") printList(id, opts);
-else if (command === "instances") printInstances(id, opts);
-else if (command === "status") printStatus(id, opts._[1], opts);
-else if (command === "tail") {
-  if (!opts._[1]) {
-    console.error("Usage: pbb tail <job>");
-    process.exit(2);
+async function run() {
+  if (command === "list" || command === "ls") return printList(id, opts);
+  if (command === "instances") return printInstances(id, opts);
+  if (command === "status") return printStatus(id, opts._[1], opts);
+  if (command === "tail") {
+    if (!opts._[1]) {
+      console.error("Usage: pbb tail <job>");
+      process.exit(2);
+    }
+    return printTail(id, opts._[1], opts);
   }
-  printTail(id, opts._[1], opts);
-} else if (command === "kill") {
-  if (!opts._[1]) {
-    console.error("Usage: pbb kill <job>");
-    process.exit(2);
+  if (command === "kill") {
+    if (!opts._[1]) {
+      console.error("Usage: pbb kill <job>");
+      process.exit(2);
+    }
+    return printKill(id, opts._[1], opts);
   }
-  printKill(id, opts._[1], opts);
-} else {
   console.error(`Unknown pbb command: ${command}`);
   process.exit(2);
+}
+
+try {
+  await run();
+} catch (error) {
+  // A crash in the sweep is still a pbb error, not a stack trace for the agent to parse.
+  console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, error: "pbb_failed" }, error instanceof Error ? error.message : String(error)));
+  process.exit(1);
 }

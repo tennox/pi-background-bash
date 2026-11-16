@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
@@ -166,7 +166,7 @@ test("a result pi truncated and then threw carries exactly one footer, naming pi
     const footers = request.match(/\[Showing lines/g) ?? [];
     assert.equal(footers.length, 1, `expected exactly one truncation footer, got ${footers.length}`);
     assert.doesNotMatch(request, /context guard/);
-    const footer = /\[Showing lines \d+-\d+ of \d+\. Full output: ([^"\\]+)\]/.exec(request);
+    const footer = /\[Showing lines \d+(?:-\d+)?(?: and \d+(?:-\d+)?)? of \d+\. Full output: ([^"\\]+)\]/.exec(request);
     assert.ok(footer, "the footer must name the full-output path");
     assert.ok(existsSync(footer[1]), `the footer names a file that must exist: ${footer[1]}`);
     assert.match(request, /Command timed out after 2 seconds/, "pi's status line must survive the reshape");
@@ -892,6 +892,134 @@ test("pbb status and pbb tail say the log is capped instead of promising the ful
       execFileSync(process.execPath, [PBB_CLI, "status", "bg003", "--json"], { env, encoding: "utf8" }).trim(),
     );
     assert.equal(running.job.logBytes, 21, "a running job's size comes from the log file");
+    // Defect 5: `status --json` used to nest the job under `.job` while `list` used
+    // `.jobs`. Both keys are there now; `jobs` (an array, like `list`) is canonical.
+    assert.ok(Array.isArray(running.jobs), "status --json carries the canonical `jobs` array");
+    assert.equal(running.jobs.length, 1);
+    assert.deepEqual(running.jobs[0], running.job, "the deprecated `job` alias is the same object");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Defect 1: `pbb list --all` spawned one `pil instances` process per session (514
+// sessions = 115-147 s). Owner liveness of a whole-root sweep is not probed unless
+// the caller asks for it with `--owner`, and an unprobed owner is `unknown` — never
+// `stale`, because not asking is not evidence.
+test("pbb list --all does not spawn a pil process per session", () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-all-fast-${process.pid}-${Date.now()}-`));
+  const pbbRoot = join(dir, "pbb");
+  const counter = join(dir, "pil-calls.txt");
+  const stub = join(dir, "pil-stub.js");
+  // A `pil` stand-in that counts its own invocations. `PBB_PIL_BIN` is executed
+  // directly (not through node), so it needs a shebang and the executable bit. It
+  // reports no lane records, so the pid fallback answers liveness whenever probing
+  // does happen.
+  writeFileSync(
+    stub,
+    `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(counter)}, "call\\n");\nconsole.log(JSON.stringify({ instances: [] }));\n`,
+  );
+  chmodSync(stub, 0o755);
+  const now = new Date().toISOString();
+  const sessions = 50;
+  const laneRoot = join(dir, "lane");
+  for (let i = 0; i < sessions; i += 1) {
+    const sessionKey = `all-fast-key-${String(i).padStart(2, "0")}`;
+    const instanceId = `pbb_${process.pid}_${String(i).padStart(8, "0")}`;
+    const jobsDir = join(pbbRoot, "sessions", sessionKey, "instances", instanceId, "jobs");
+    mkdirSync(jobsDir, { recursive: true });
+    // pi-lane "has recorded" these sessions (an empty records dir is enough): that
+    // is the only case where a probe is worth a subprocess.
+    mkdirSync(join(laneRoot, "sessions", sessionKey, "instances"), { recursive: true });
+    for (const jobId of ["bg001", "bg002", "bg003"]) {
+      writeFileSync(
+        join(jobsDir, `${jobId}.json`),
+        JSON.stringify({ jobId, globalJobId: `${instanceId}:${jobId}`, status: "exited", exitCode: 0, command: `job-of-${sessionKey}`, startedAt: now, instanceId }),
+      );
+    }
+  }
+  const pilCalls = () => (existsSync(counter) ? readFileSync(counter, "utf8").split("\n").filter(Boolean).length : 0);
+  const env = {
+    ...process.env,
+    PBB_PIL_BIN: stub,
+    PBB_ROOT: pbbRoot,
+    PI_LANE_ROOT: laneRoot,
+    PI_LANE_SESSION_KEY: "all-fast-current",
+    PI_LANE_SESSION_ID: "all-fast-session",
+    PI_LANE_INSTANCE_ID: "all-fast-instance",
+    PI_LANE_CURRENT_LANE: "main",
+  };
+  try {
+    const all = execFileSync(process.execPath, [PBB_CLI, "list", "--all"], { env, encoding: "utf8" });
+    assert.equal((all.match(/- job=bg001 /g) ?? []).length, sessions, "every session's jobs are listed");
+    assert.match(all, /scope=all/);
+    assert.equal(pilCalls(), 0, "a whole-root sweep must not spawn pil at all");
+    assert.match(all, /owner=unknown \(owner liveness not probed/, "an unprobed owner is unknown, never stale");
+    assert.doesNotMatch(all, /owner=stale/);
+    assert.match(all, /add --owner/);
+
+    // `--owner` asks for it: one probe per SESSION (50), never per job (150).
+    const owned = execFileSync(process.execPath, [PBB_CLI, "list", "--all", "--owner"], { env, encoding: "utf8" });
+    assert.equal(pilCalls(), sessions, "probing is one pil call per session, not one per job");
+    assert.doesNotMatch(owned, /owner liveness not probed/);
+
+    // The narrow default view keeps its normal shape (no "not probed" banner); with
+    // no jobs in scope it has nothing to probe.
+    const narrow = execFileSync(process.execPath, [PBB_CLI, "list"], { env, encoding: "utf8" });
+    assert.match(narrow, /No background bash jobs in scope/);
+    assert.doesNotMatch(narrow, /owner liveness not probed/);
+    assert.equal(pilCalls(), sessions, "a narrow view with no jobs probes nothing");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Defect 3: a foreground call records no job (by design) but does leave
+// `<instance>/logs/<id>.log`, and every truncated result advertises
+// `pbb tail <id> --full`. That pointer used to exit 2 `unknown job`.
+test("pbb tail falls back to the log file for an id that has no job record", () => {
+  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-logonly-${process.pid}-${Date.now()}-`));
+  const pbbRoot = join(dir, "pbb");
+  const instanceDir = join(pbbRoot, "sessions", "logonly-key", "instances", "logonly-instance");
+  mkdirSync(join(instanceDir, "logs"), { recursive: true });
+  writeFileSync(join(instanceDir, "logs", "bg012.log"), "foreground-head\nforeground-tail\n");
+  const env = {
+    ...process.env,
+    PBB_ROOT: pbbRoot,
+    PI_LANE_SESSION_KEY: "logonly-key",
+    PI_LANE_SESSION_ID: "logonly-session",
+    PI_LANE_INSTANCE_ID: "logonly-instance",
+    PI_LANE_CURRENT_LANE: "main",
+  };
+  try {
+    const tail = execFileSync(process.execPath, [PBB_CLI, "tail", "bg012"], { env, encoding: "utf8" });
+    assert.match(tail, /foreground-head/);
+    assert.match(tail, /foreground-tail/);
+    assert.match(tail, /kind=log-only/);
+    assert.match(tail, /job_kind="log-only"/);
+    assert.match(tail, /logs\/bg012\.log/);
+    assert.doesNotMatch(tail, /status=/, "no job fields are fabricated for a log-only id");
+
+    const json = JSON.parse(execFileSync(process.execPath, [PBB_CLI, "tail", "bg012", "--json"], { env, encoding: "utf8" }).trim());
+    assert.equal(json.jobKind, "log-only");
+    assert.equal(json.job, undefined, "a log-only tail invents no job record");
+    assert.match(json.logPath, /logs\/bg012\.log$/);
+    assert.match(json.log, /foreground-head/);
+
+    // `--full` works on the fallback too: the advertised flag is not decorative.
+    const full = execFileSync(process.execPath, [PBB_CLI, "tail", "bg012", "--full"], { env, encoding: "utf8" });
+    assert.match(full, /foreground-head[\s\S]*foreground-tail/);
+
+    // An id with neither a job nor a log is still an unknown job (exit 2).
+    assert.throws(
+      () => execFileSync(process.execPath, [PBB_CLI, "tail", "bg999"], { env, encoding: "utf8", stdio: "pipe" }),
+      /Command failed/,
+    );
+    // A path-looking "id" never reaches outside the logs directory.
+    assert.throws(
+      () => execFileSync(process.execPath, [PBB_CLI, "tail", "../../etc/passwd"], { env, encoding: "utf8", stdio: "pipe" }),
+      /Command failed/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1418,7 +1546,11 @@ test("bash background true kills active jobs when the session closes", async () 
   assert.equal(existsSync(marker), false, "background job should be killed on session close");
 });
 
-test("bash background true truncates verbose PBB results and pbb tail --full returns complete output", async () => {
+// Defect 2: the completion body used to be a tail window only, so a 3000-line job
+// delivered lines 1001-3000 and lost the head — the opposite of the decision that
+// foreground and background output are formatted identically. The body now goes
+// through the same `formatLogFile` head+tail path as a tool result.
+test("bash background true sends a verbose completion with head, omitted marker and tail", async () => {
   const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-truncate-${process.pid}-${Date.now()}-`));
   const pbbRoot = join(dir, "pbb");
   const env = {
@@ -1430,7 +1562,7 @@ test("bash background true truncates verbose PBB results and pbb tail --full ret
     PI_LANE_CURRENT_LANE: "main",
   };
   const mock = await createBgMock(script(
-    bg("python3 - <<'PY'\nfor i in range(2105): print(f'line {i}')\nPY"),
+    bg("seq 1 3000"),
     text("initial turn complete"),
     text("saw truncated result"),
   ), { env });
@@ -1439,13 +1571,20 @@ test("bash background true truncates verbose PBB results and pbb tail --full ret
     await mock.run("start a verbose background command", TIMEOUT);
     const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes(" finished after "), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /Showing lines \d+-\d+ of \d+\. Full output: pbb tail bg001 --full/);
-    assert.match(textReq, /line 2104/);
-    assert.doesNotMatch(textReq, /line 0\nline 1\nline 2/);
+    // Head: the command's own first lines (line 1 was unreachable while the body
+    // was a tail window of pi's 2000-line limit).
+    assert.match(textReq, /^1\n2\n3$/m, "the completion body must start with the command's first lines");
+    assert.doesNotMatch(textReq, /^1001$/m, "the body must not start at pi's window edge");
+    // Marker + exact counts.
+    assert.match(textReq, /… 2987 lines \/ [\d.]+KB omitted …/);
+    // Tail: the last lines, in order.
+    assert.match(textReq, /\n2991\n2992\n2993[\s\S]*\n3000$/m);
+    // Footer describes both windows and names the route to everything.
+    assert.match(textReq, /\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: pbb tail bg001 --full\]/);
 
     const tail = execFileSync(process.execPath, [PBB_CLI, "tail", "bg001", "--full"], { env: { ...process.env, ...env }, encoding: "utf8" });
-    assert.match(tail, /line 0/);
-    assert.match(tail, /line 2104/);
+    assert.match(tail, /^1$/m);
+    assert.match(tail, /^3000$/m);
   } finally {
     await mock.close();
     rmSync(dir, { recursive: true, force: true });
@@ -2013,6 +2152,8 @@ test("a truncated foreground result names its job log, which holds the whole out
 
       const result = await session.bash().execute("call-verbose", { command }, undefined, undefined, session.ctx);
       const text = resultText(result);
+      // This text is the tool's raw result (pi's own tail-window notice), not the
+      // model-facing reshape the context hook applies later.
       assert.match(text, /Showing lines \d+-\d+ of 3000/);
       assert.match(text, /Full output: \/.*bg001\.log\]/);
       assert.doesNotMatch(text, /pi-bash/, "pi's temp file must not be named any more");

@@ -8,13 +8,16 @@
  *  (a) presentation — applied to every bash result and every completion body:
  *      collapse `\r` progress frames to their last frame and strip ANSI/control
  *      sequences. No size budget, no path rewriting, no exceptions.
- *  (b) head+tail reshape — applied only where pi already decided the output was
- *      truncated (`details.truncation` / `details.fullOutputPath`) or where a job
- *      log hit `maxLogBytes`. Both ends are read from the full-output file when
- *      it is readable — the head of pi's tail window is line 1001, not line 1 —
- *      so the model sees the command's own first lines. Everything else passes
- *      through byte-for-byte, so this layer can never make a result tighter than
- *      builtin bash (COMPARISON.md decision 6).
+ *  (b) head+tail reshape — applied to what pi already decided was truncated
+ *      (`details.truncation` / `details.fullOutputPath`), to a multi-entry digest
+ *      longer than pi's window, and to a single job's completion body: a
+ *      completion body goes through `formatLogFile`, the same head+tail path as a
+ *      tool result, so a 3000-line background job reads exactly like a 3000-line
+ *      foreground result (PLAN §6/§7b). Both ends are read from the full-output
+ *      file when it is readable — the head of pi's tail window is line 1001, not
+ *      line 1 — so the model sees the command's own first lines. Everything else
+ *      passes through byte-for-byte, so this layer can never make a result tighter
+ *      than builtin bash (COMPARISON.md decision 6).
  *
  * Deliberately dependency-free (only `node:*`): no import from pi, so the tests
  * need no pi runtime and this module cannot quietly grow into owning pi's
@@ -207,11 +210,60 @@ function assemble({ head, tail, omittedLines, omittedBytes, footer, notices = []
 	return blocks.join("\n\n");
 }
 
-function tailFooter(totalLines: number, tailLines: number, options: { fullOutputPath?: string; byteLimit?: number }): string {
-	const first = Math.max(1, totalLines - tailLines + 1);
+/**
+ * One shown window: where it starts (1-based, counted in the command's own lines)
+ * and how many lines it holds.
+ */
+export interface ShownWindow {
+	first: number;
+	lines: number;
+}
+
+function windowLabel(window: ShownWindow): string {
+	if (window.lines <= 1) return `${window.first}`;
+	return `${window.first}-${window.first + window.lines - 1}`;
+}
+
+/**
+ * The footer for a reshaped body.
+ *
+ * It names **every** window the body actually shows. A head+tail body that
+ * carried only `[Showing lines 4991-5000 of 5000 …]` told the model the head was
+ * not there while three head lines sat above the marker — the footer has to
+ * describe the body it belongs to, not just pi's tail window.
+ *
+ * Counts are line numbers in the command's output, so a 5000-line result with
+ * three head and ten tail lines reads `[Showing lines 1-3 and 4991-5000 of 5000.
+ * Full output: <path>]`. With no head (`headLines: 0`) the footer is exactly pi's
+ * own wording.
+ */
+function shownFooter(
+	totalLines: number,
+	windows: { head?: ShownWindow; tail?: ShownWindow },
+	options: { fullOutputPath?: string; byteLimit?: number },
+): string {
+	const parts: string[] = [];
+	if (windows.head && windows.head.lines > 0) parts.push(windowLabel(windows.head));
+	if (windows.tail && windows.tail.lines > 0) parts.push(windowLabel(windows.tail));
 	const limit = options.byteLimit !== undefined ? ` (${formatSize(options.byteLimit)} limit)` : "";
 	const path = options.fullOutputPath ? `. Full output: ${options.fullOutputPath}` : "";
-	return `[Showing lines ${first}-${totalLines} of ${totalLines}${limit}${path}]`;
+	// With no window at all (a big file whose line count is unknown) still say so.
+	const shown = parts.length > 0 ? `lines ${parts.join(" and ")}` : "no lines";
+	return `[Showing ${shown} of ${totalLines}${limit}${path}]`;
+}
+
+/**
+ * Footer for a body reshaped from a file whose line count is unknown (only the
+ * first/last byte windows were read): the counts are ours, so they are the only
+ * honest numbers available.
+ */
+function windowCountFooter(windows: { head?: ShownWindow; tail?: ShownWindow }, fullOutputPath?: string): string {
+	const parts: string[] = [];
+	if (windows.head && windows.head.lines > 0) parts.push(`the first ${windows.head.lines} line${windows.head.lines === 1 ? "" : "s"}`);
+	if (windows.tail && windows.tail.lines > 0) parts.push(`the last ${windows.tail.lines} line${windows.tail.lines === 1 ? "" : "s"}`);
+	const shown = parts.length > 0 ? parts.join(" and ") : "no lines";
+	const path = fullOutputPath ? `. Full output: ${fullOutputPath}` : "";
+	return `[Showing ${shown}${path}]`;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -512,10 +564,21 @@ export function formatForModel(options: FormatForModelOptions): string {
 			? totalBytes - keptBytes
 			: Math.max(0, Buffer.byteLength(body, "utf8") - keptBytes);
 
+	// The footer names both windows the body shows. The head sits at the command's
+	// first line only when it came from the full-output file; the fallback head is
+	// the head of pi's tail window and is numbered where that window starts.
+	const shownHeadLines = headLines > 0 && head !== "" ? headLines : 0;
+	const shownTailLines = tailLines > 0 && tail !== "" ? tailLines : 0;
+	const headFirst = fromFile ? 1 : Math.max(1, totalLines - lines.length + 1);
+	const tailFirst = Math.max(1, totalLines - shownTailLines + 1);
+	const windows = {
+		...(shownHeadLines > 0 ? { head: { first: headFirst, lines: shownHeadLines } } : {}),
+		...(shownTailLines > 0 ? { tail: { first: tailFirst, lines: shownTailLines } } : {}),
+	};
 	// A partial last line has no line number to report: keep pi's own wording.
 	const footer = truncation?.lastLinePartial
-		? (notice ?? tailFooter(totalLines, tailLines, { fullOutputPath }))
-		: tailFooter(totalLines, tailLines, {
+		? (notice ?? shownFooter(totalLines, windows, { fullOutputPath }))
+		: shownFooter(totalLines, windows, {
 				fullOutputPath,
 				byteLimit: truncation?.truncatedBy === "bytes" ? (truncation.maxBytes ?? DEFAULT_OUTPUT_FORMAT.maxBytes) : undefined,
 			});
@@ -667,10 +730,18 @@ export function formatLogFile(path: unknown, options: FormatLogFileOptions = {})
 		omittedBytes = Math.max(0, size - (Buffer.byteLength(head, "utf8") + Buffer.byteLength(tail, "utf8")));
 	}
 
+	const shownHeadLines = headLines > 0 && head !== "" ? headLines : 0;
+	const shownTailLines = tailLines > 0 && tail !== "" ? tailLines : 0;
+	const windows = {
+		...(shownHeadLines > 0 ? { head: { first: 1, lines: shownHeadLines } } : {}),
+		// `first: 0` when the total is unknown (only the byte windows were read):
+		// `windowCountFooter` counts lines, it does not number them.
+		...(shownTailLines > 0 ? { tail: { first: totalLines !== undefined ? Math.max(1, totalLines - shownTailLines + 1) : 0, lines: shownTailLines } } : {}),
+	};
 	const footer =
 		totalLines !== undefined
-			? tailFooter(totalLines, tailLines, { fullOutputPath })
-			: `[Full output: ${fullOutputPath}]`;
+			? shownFooter(totalLines, windows, { fullOutputPath })
+			: windowCountFooter(windows, fullOutputPath);
 	return assemble({ head, tail, omittedLines: totalLines !== undefined ? Math.max(0, totalLines - headLines - tailLines) : undefined, omittedBytes, footer, notices });
 }
 
@@ -695,13 +766,13 @@ function tailByBytes(text: string, maxBytes: number): string {
 }
 
 /**
- * pi's own result cap (tail window, `truncate.ts`) applied to a completion body,
- * with pi's wording so the model reads it like any other truncated bash result.
+ * pi's own result cap (tail window, `truncate.ts`) applied to a multi-entry
+ * aggregate (the reconcile digest), with pi's wording so the model reads it like
+ * any other truncated bash result.
  *
- * This is what the completion body uses today. Note what it is NOT: the
- * head+tail reshape of `formatLogFile` is deliberately not used for every
- * completion — PLAN §7b reshapes a completion only when its log hit
- * `maxLogBytes` — see the call site in `extensions/background-bash.ts`.
+ * Note what it is NOT: a single job's completion body never uses this — it goes
+ * through `formatLogFile`, i.e. the same head+tail path as a tool result (PLAN
+ * §7b / §6) — see the call site in `extensions/background-bash.ts`.
  */
 export function capBodyToPiWindow(text: string, options: CapBodyOptions = {}): string {
 	if (typeof text !== "string" || text === "") return "";
@@ -720,8 +791,10 @@ export function capBodyToPiWindow(text: string, options: CapBodyOptions = {}): s
 	}
 	if (truncatedBy === null) return presented;
 	const totalLines = lines.length;
-	const first = Math.max(1, totalLines - keptLines.length + 1);
-	const limit = truncatedBy === "bytes" ? ` (${formatSize(maxBytes)} limit)` : "";
-	const path = options.fullOutputPath ? `. Full output: ${options.fullOutputPath}` : "";
-	return `${kept}\n\n[Showing lines ${first}-${totalLines} of ${totalLines}${limit}${path}]`;
+	const footer = shownFooter(
+		totalLines,
+		{ tail: { first: Math.max(1, totalLines - keptLines.length + 1), lines: keptLines.length } },
+		{ fullOutputPath: options.fullOutputPath, byteLimit: truncatedBy === "bytes" ? maxBytes : undefined },
+	);
+	return `${kept}\n\n${footer}`;
 }

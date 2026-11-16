@@ -210,11 +210,24 @@ sequences, head+tail with the log path). That splits the layer into two differen
 **(a) presentation — every bash result and every pbb completion body**: collapse `\r` to the
 last frame, strip escapes. No size budget, no path rewriting, no exceptions.
 
-**(b) head+tail reshape — only where pi already decided the result is truncated**: a tool
+**(b) head+tail reshape — the same path for tool results and completion bodies**: a tool
 result carrying `details.truncation` / `details.fullOutputPath` (built at `bash.ts:343`,
-returned at `bash.ts:404-408`), or a completion body whose log hit `maxLogBytes`. Everything
-else passes through byte-for-byte, so a foreground call can never become tighter than builtin
-bash: the trigger stays pi's 2000 lines / 50 KB (`truncate.ts:11-12`).
+returned at `bash.ts:404-408`), and **every** completion body, built by
+`formatLogFile(path, …)` from the job log. A completion body is therefore formatted exactly
+like a foreground result: `formatLogFile` reads the log's first `headLines` and last
+`tailLines` lines (two seeks, never a whole 100 MB read), emits
+`… N lines / X omitted …` between them and closes with `Full output: …` — but only when the
+log exceeds pi's window; a log that fits in 2000 lines / 50 KB is sent whole. A log that hit
+`maxLogBytes` additionally states that its tail is not the end of the output. Anything else
+(tool results pi did not truncate) passes through byte-for-byte, so a foreground call can
+never become tighter than builtin bash: the trigger stays pi's 2000 lines / 50 KB
+(`truncate.ts:11-12`).
+
+Why completion bodies are not an exception (they were, and it was a bug): §6 promises
+"head+tail from the log file", and the live exercise showed the older tail-only body
+delivering 12.1 KB of lines 1001-3000 for a promoted `seq 1 3000` — head lost, contradicting
+the decision that foreground and background output are formatted identically. `formatLogFile`
+is the one function both use.
 
 This is the honest consequence of Decision 6: until head+tail lands in pi core's bash tool,
 this layer is a local stand-in that only reshapes what core already truncated — and the "head"
@@ -230,10 +243,13 @@ Pure functions:
   `truncateTail(text, { maxLines: tailLines })` (`truncate.ts`) — then join them with
   `… N lines omitted …`, `N = totalLines - headLines - tailLines` from
   `details.truncation.totalLines`. Footer reuses pi's wording, `Full output: <path>` (omitted
-  only when no path exists). Idempotent: a body already carrying the omitted marker is left
-  alone.
+  only when no path exists) — and it names **every** window the body shows
+  (`[Showing lines 1-3 and 4991-5000 of 5000. Full output: <path>]`): a body with three head
+  lines above the marker may not claim it shows only the tail window. Idempotent: a body
+  already carrying the omitted marker is left alone.
 - `formatLogFile(path, { headLines, tailLines })`: the completion-body variant, reading only
-  the first/last bytes of the file (no whole-file reads), so a 100 MB log costs two seeks.
+  the first/last bytes of the file (no whole-file reads), so a 100 MB log costs two seeks. It
+  is what §6's completion body calls.
 
 Hook (`pi.on("context")`):
 - for each `toolResult` of `bash` and each `custom_message` carrying `details.fullOutputPath`:

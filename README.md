@@ -112,7 +112,8 @@ This package also installs `pbb`, a small inspector for background bash jobs.
 pbb self
 pbb list
 pbb list --scope session   # widen: every instance of this session
-pbb list --all             # widen: every session under the root
+pbb list --all             # widen: every session under the root (no liveness probe: seconds)
+pbb list --all --owner     # … with owner liveness probed (one pil call per session)
 pbb status bg001
 pbb tail bg001 -n 80
 pbb kill bg001
@@ -157,16 +158,19 @@ Background job state is stored under:
 The `bash` tool result the model reads is not the TUI's text, and it is not the log. Three
 surfaces, three owners:
 
-- **the model** reads a presentation pass over every bash result and completion: ANSI/control
-  sequences stripped, `\r` progress frames collapsed to their last frame. If pi truncated the result,
-  it is reshaped to the **first 3 lines + `… N lines / <size> omitted …` + the last 10 lines + `Full
-  output: <path>`**. Both ends are read from that full-output file, so the head really is the
-  command's first lines (pi's own text starts at the first line of its *tail* window); the omitted
-  count comes from pi's own totals and counts the lines *absent from the body*, not the lines between
-  the shown head and tail. Without a readable full-output file the reshape falls back to the head of
-  pi's window. A result pi did not truncate is passed through byte-for-byte, because this layer keeps
-  no truncation budget of its own. Each body is frozen per `toolCallId`, so a still-growing log can
-  never move text the model already saw.
+- **the model** reads a presentation pass over every bash result and **every completion body**:
+  ANSI/control sequences stripped, `\r` progress frames collapsed to their last frame. If pi
+  truncated the result, it is reshaped to the **first 3 lines + `… N lines / <size> omitted …` +
+  the last 10 lines + `Full output: <path>`**, and the footer names every window the body shows
+  (`[Showing lines 1-3 and 2991-3000 of 3000. …]`). Both ends are read from that full-output file,
+  so the head really is the command's first lines (pi's own text starts at the first line of its
+  *tail* window); the omitted count comes from pi's own totals and counts the lines *absent from the
+  body*, not the lines between the shown head and tail. A background completion body is built the
+  same way from the job log (`formatLogFile`), so a promoted call reads like a foreground result —
+  a log that fits pi's window (2000 lines / 50 KB) is sent whole. Without a readable full-output
+  file the reshape falls back to the head of pi's window. A result pi did not truncate is passed
+  through byte-for-byte, because this layer keeps no truncation budget of its own. Each body is
+  frozen per `toolCallId`, so a still-growing log can never move text the model already saw.
 - **the log** (`logs/<jobId>.log`) holds the command's raw bytes — nothing added, no cap marker, no
   formatting. `pbb tail <job> --full` and `rg` read exactly that.
 - **the TUI** renders the stored transcript entries, and **codemode** reads `structuredContent`:
@@ -214,7 +218,7 @@ Output formatting has its own config file, `~/.pi/bash-output.json`, with a per-
 | --- | --- | --- |
 | `headLines` | `3` | lines shown from the start of a result pi truncated (and of a capped job log) |
 | `tailLines` | `10` | lines shown from the end of such a result |
-| `maxLines` | `2000` | pi's own truncation window — a completion body is capped like a tool result, with no extra budget of this layer's own |
+| `maxLines` | `2000` | pi's own truncation window — a completion body is formatted like a tool result (head + marker + tail), with no extra budget of this layer's own |
 | `maxBytes` | `51200` | byte budget of the same window, and how much of a log is read from each end |
 
 Job logs older than 7 days are deleted at `session_start`, except for jobs that are still

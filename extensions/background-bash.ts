@@ -758,14 +758,10 @@ function waitForBackgroundThreshold(seconds: number): Promise<"background"> {
 	});
 }
 
-function completionBody(output: string, suffix: string): string {
-	return output ? `${output.replace(/\s*$/, "")}\n\n${suffix}` : suffix;
-}
-
 /**
  * The tail of a log file, at most `maxBytes` from its end, starting on a line
- * boundary. Completion and digest bodies are built from this instead of from
- * the (now removed) per-chunk `job.output` events.
+ * boundary. `tailOfLog` (the reconcile digest) uses this for the short per-entry
+ * previews; a *completion body* is built by `formatLogFile` instead.
  *
  * A byte window rarely lands on a line start, so the window is read one byte
  * early: if that byte is a newline the window begins exactly on a line boundary
@@ -823,32 +819,29 @@ function completionNotices(job: ActiveJob, result: JobResult): string[] {
 /**
  * The completion body: the command's own output plus how it ended. Formatting
  * lives in `lib/output-format.ts` (PLAN §7) — this only hands it the log file and
- * the notices:
+ * the notices.
  *
- *  - a log that hit `maxLogBytes` is reshaped from its first and last bytes and
- *    says that its tail is not the true end of the output (PLAN §7b);
- *  - any other log is capped exactly like a pi tool result — the tail window
- *    pi uses, with `pbb tail <job>` as the route to everything (decision 6: no
- *    truncation numbers of our own, and no head+tail where pi would not truncate).
+ * Every completion goes through `formatLogFile`, i.e. the **same** head+tail path
+ * as a tool result (PLAN §6 + §7b): the log's first `headLines` lines, the omitted
+ * marker, its last `tailLines` lines, and `Full output: pbb tail <job> --full`;
+ * a log that fits pi's window (2000 lines / 50 KB) is sent whole. A log that hit
+ * `maxLogBytes` additionally says that its tail is not the true end of the output.
+ *
+ * It used to be a tail window only (`capBodyToPiWindow`), so a promoted
+ * `seq 1 3000` delivered 1001-3000 with no head at all — the exact opposite of the
+ * decision that foreground and background output read identically.
  */
 function completionBodyFromLog(job: ActiveJob, result: JobResult): string {
 	const { headLines, tailLines, maxLines, maxBytes } = loadOutputFormatConfig(job.cwd);
-	const notices = completionNotices(job, result);
-	if (job.logTruncated) {
-		return formatLogFile(job.logPath, {
-			headLines,
-			tailLines,
-			maxLines,
-			maxBytes,
-			fullOutputPath: `pbb tail ${job.id} --full`,
-			logTruncated: true,
-			logBytes: job.logBytes ?? 0,
-			notices,
-		});
-	}
-	const output = readLogTail(job.logPath);
-	const body = notices.length > 0 ? completionBody(output, notices.join("\n")) : output;
-	return capBodyToPiWindow(body, { maxLines, maxBytes, fullOutputPath: `pbb tail ${job.id} --full` });
+	return formatLogFile(job.logPath, {
+		headLines,
+		tailLines,
+		maxLines,
+		maxBytes,
+		fullOutputPath: `pbb tail ${job.id} --full`,
+		notices: completionNotices(job, result),
+		...(job.logTruncated ? { logTruncated: true, logBytes: job.logBytes ?? 0 } : {}),
+	});
 }
 
 /* ------------------------------------------------------------------------- *

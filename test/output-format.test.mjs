@@ -119,7 +119,7 @@ test("formatForModel reshapes a pi-truncated result to head + omitted marker + t
   assert.equal(marker, `… ${10050 - 3 - 10} lines / ${omittedKb}KB omitted …`);
   const blocks = formatted.split("\n\n");
   assert.equal(blocks.at(-2), windowLines.slice(-10).join("\n"), "tail keeps the last 10 lines");
-  assert.match(lines.at(-1), /^\[Showing lines 10041-10050 of 10050\. Full output: \/tmp\/pi-bash-abc\.log\]$/);
+  assert.match(lines.at(-1), /^\[Showing lines 9951-9953 and 10041-10050 of 10050\. Full output: \/tmp\/pi-bash-abc\.log\]$/);
   // pi's own, now-stale notice line must not survive inside the tail.
   assert.equal(formatted.match(/\[Showing lines/g).length, 1);
 });
@@ -149,7 +149,7 @@ test("formatForModel takes the head from the full-output file, not from pi's tai
     assert.ok(marker?.startsWith("… 2987 lines"), `the marker counts the lines absent from the body: ${marker}`);
     const blocks = body.split("\n\n");
     assert.equal(blocks.at(-2), all.slice(-10).join("\n"), "the tail still comes from the end of the output");
-    assert.match(blocks.at(-1), /^\[Showing lines 2991-3000 of 3000\. Full output: .*bg001\.log\]$/);
+    assert.match(blocks.at(-1), /^\[Showing lines 1-3 and 2991-3000 of 3000\. Full output: .*bg001\.log\]$/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -180,8 +180,11 @@ test("formatForModel reads pi's notice back when pi threw the truncated result a
     const formatted = formatForModel({ text, headLines: 3, tailLines: 10 });
     assert.equal((formatted.match(/\[Showing lines/g) ?? []).length, 1, "exactly one truncation footer");
     assert.ok(
-      formatted.includes(`[Showing lines 2991-3000 of 3000. Full output: ${logPath}]`),
-      "the footer names pi's real file",
+      // The file is too small to be the full output, so the head is the head of
+      // pi's window (1001-1003) — and the footer says so honestly instead of
+      // claiming the body shows lines 1-3.
+      formatted.includes(`[Showing lines 1001-1003 and 2991-3000 of 3000. Full output: ${logPath}]`),
+      `the footer names pi's real file and both windows: ${formatted.split("\n").at(-2)}`,
     );
     assert.doesNotMatch(formatted, /context guard/);
     assert.match(formatted, /Command timed out after 2 seconds/, "pi's status line survives and follows the footer");
@@ -271,6 +274,61 @@ test("formatLogFile never emits a replacement char where a window splits a multi
       assert.match(body, /^zeile 0 äöü 𝄞𝄞$/m);
       assert.match(body, /zeile 199 äöü 𝄞𝄞$/m);
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Defect 4: the footer said `[Showing lines 3991-4000 of 5000 …]` while three head
+// lines sat above the omitted marker — it described pi's tail window, not the body.
+test("the footer names every window the body shows, and its counts match the body", async () => {
+  const { formatLogFile, formatForModel } = await loadLib();
+  const dir = tempDir("footer-windows");
+  const lines = Array.from({ length: 400 }, (_, i) => `row-${String(i).padStart(3, "0")}`);
+  const path = join(dir, "bg006.log");
+  writeFileSync(path, `${lines.join("\n")}\n`);
+  // Read the footer back and check it against the body it belongs to.
+  const windowsOf = (body) => {
+    const footer = /^\[Showing lines (.+?) of (\d+)\. Full output: (.+)\]$/m.exec(body);
+    assert.ok(footer, `the body must end in one footer, got: ${body.split("\n").at(-1)}`);
+    const ranges = footer[1].split(" and ").map((part) => {
+      const [first, last] = part.split("-");
+      return { first: Number(first), last: Number(last ?? first) };
+    });
+    return { ranges, total: Number(footer[2]), path: footer[3] };
+  };
+  try {
+    // Small file, counted exactly: head 3 / tail 10 of 400 lines.
+    const body = formatLogFile(path, { headLines: 3, tailLines: 10, maxLines: 10, maxBytes: 50_000 });
+    const { ranges, total, path: named } = windowsOf(body);
+    assert.equal(total, 400);
+    assert.equal(named, path, "the footer names the full output; with no explicit route it is the log itself");
+    assert.deepEqual(ranges, [{ first: 1, last: 3 }, { first: 391, last: 400 }]);
+    const blocks = body.split("\n\n");
+    // The head block really holds the first 3 lines, the tail block the last 10.
+    assert.deepEqual(blocks[0].split("\n"), lines.slice(0, 3));
+    assert.deepEqual(blocks.at(-2).split("\n"), lines.slice(-10));
+    assert.equal(ranges[0].last - ranges[0].first + 1, blocks[0].split("\n").length, "head count matches the head block");
+    assert.equal(ranges[1].last - ranges[1].first + 1, blocks.at(-2).split("\n").length, "tail count matches the tail block");
+
+    // A body with no head window names only the tail (pi's own wording).
+    assert.match(formatLogFile(path, { headLines: 0, tailLines: 10, maxLines: 10, maxBytes: 50_000 }), /\[Showing lines 391-400 of 400\. Full output: /);
+
+    // A big file whose line count is unknown says which windows it shows instead
+    // of pretending a total it never counted.
+    const bigFooter = formatLogFile(path, { headLines: 2, tailLines: 3, maxLines: 10, maxBytes: 200 });
+    assert.match(bigFooter, /\[Showing the first 2 lines and the last 3 lines\. Full output: .*bg006\.log\]/);
+
+    // formatForModel names both windows too, using pi's numbering.
+    const window = lines.slice(100);
+    const shaped = formatForModel({
+      text: `${window.join("\n")}\n\n[Showing lines 101-400 of 400. Full output: ${path}]`,
+      fullOutputPath: path,
+      truncation: { truncated: true, truncatedBy: "lines", totalLines: 400, outputLines: 300 },
+      headLines: 3,
+      tailLines: 10,
+    });
+    assert.match(shaped, /^\[Showing lines 1-3 and 391-400 of 400\. Full output: .*bg006\.log\]$/m);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

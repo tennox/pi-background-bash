@@ -36,10 +36,30 @@ Widening is always explicit:
 ```bash
 pbb list --scope session     # every instance of this session
 pbb list --all               # every session under the root (== --scope all), for forensics
+pbb list --all --owner       # … and probe owner liveness (one pil call per session)
 pbb instances                # instances of this session; --all for every session
 pbb status --instance <instance_id> <job_id>
 pbb tail --instance <instance_id> <job_id>
 ```
+
+`--all` returns in about a second, even with 500+ sessions, because it does **not** probe
+owner liveness (that used to be one `pil instances` process per session, i.e. minutes).
+Unprobed owners read `owner=unknown` with a note; `--owner` probes them. Never read an
+unprobed `unknown` as evidence that an owner is gone.
+
+`pbb status <id> --json` carries the job as `jobs: [job]` (an array, the same shape `pbb list`
+uses; canonical). The single-object `job` key is a deprecated alias of the same record.
+
+## Tailing
+
+`pbb tail <job_id>` prints the last 80 lines, `--full` the whole log, `-n N` another count.
+
+A **foreground** call records no job (pi's own result is the record), but it does leave
+`<instance>/logs/<job_id>.log` — and every truncated result and completion advertises
+`pbb tail <job_id> --full`. For such an id `pbb tail` falls back to the log file and reports
+`kind=log-only` (`jobKind: "log-only"` in `--json`), with the session/instance the log came
+from; no job fields are invented. If several instances have a log under that id, the most
+recently written one is shown and the count of others is named — use `--instance` to pick.
 
 ## Owner liveness
 
